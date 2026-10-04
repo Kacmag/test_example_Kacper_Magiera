@@ -25,7 +25,8 @@ RUBRIC -- weights live in ALL_CRITERIA, each next to the clause it comes from
                                              engraved area found again
   7  no unrequested changes            0.5   shape/position of the bodies the
                                              edit leaves alone, housing Y/Z
-                                             spans; housing surface: stage E
+                                             spans, housing top surface
+                                             outside the edit zones
   8  rebuilds cleanly                  0.5   new failing features, sketches in
                                              an error state, new warnings
 
@@ -113,7 +114,7 @@ BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "3.0.0-d"
+HARNESS_VERSION = "3.0.0-e"
 #: /6: engraving-scale faces of every body (area, tessellated centroid,
 #: normal), the housing's tessellated height maps and each body's X-skew,
 #: on top of /5 (exact extreme points, +X ray section of the housing, raw
@@ -210,7 +211,9 @@ TOL = {
     # -- 4 START/SELECT ----------------------------------------------------
     "stsel_perfect_mm": 0.5,     # same rounding as above; zero is |u_seed|:
                                  # an item that has not crossed the plane
-    # -- 7 unrequested (interim parts) -------------------------------------
+    # -- 7 unrequested ----------------------------------------------------
+    # (the housing-surface threshold and area are read off the seed: see
+    # seed_map_scales)
     "fp_perfect": 0.01,          # unchanged B-rep mass props repeat to ~1e-5;
                                  # 1 % is the smallest deliberate resize
     "fp_zero": 0.08,
@@ -1538,9 +1541,12 @@ def seed_labels(baseline):
 # housing surface: height maps compared under the widening warp
 # --------------------------------------------------------------------------
 
-#: Beside the seam where the widening inserts material.
+#: Beside the seam where the widening inserts material: the warp jumps by
+#: 2h there, and a bilinear sample straddles the jump for one cell on each
+#: side, plus one cell for rounding h -- two 1 mm cells.
 SEAM_MARGIN_M = 0.002
-#: Around every feature the conversion swaps (one map cell is 1 mm).
+#: Around every feature the conversion swaps: the same two cells (a feature
+#: mirrored about a plane that falls mid-cell lands up to a cell off).
 MASK_DILATE_M = 0.002
 #: Steeper than 45 deg, a sub-cell lateral shift reads as a height change.
 SLOPE_MAX = 1.0
@@ -2396,10 +2402,10 @@ class Grader:
         return {"score": round(score, 4), "status": status_of(score),
                 "components": {k: round(v, 4) for k, v in parts.items()},
                 "detail": det,
-                "evidence": "the weaker part decides: bodies the edit leaves "
-                            "alone keep shape and y/z, housing keeps its Y/Z "
-                            "spans. Added hardware is reported, not scored. "
-                            "Housing surface comparison arrives in stage E"}
+                "evidence": "the weakest part decides: bodies the edit leaves "
+                            "alone keep shape and y/z, the housing keeps its "
+                            "Y/Z spans and, outside the edit zones, its top "
+                            "surface. Added hardware is reported, not scored"}
 
     # -- 8 ---------------------------------------------------------------
     def c_rebuild(self):
@@ -2471,7 +2477,7 @@ class Grader:
         report["criteria"][C_STSEL] = self.c_stsel()
         report["criteria"][C_ORIENT] = self.c_orient()
         report["criteria"][C_KEPT] = self.c_kept()
-        report["criteria"][C_UNREQ] = self.c_unreq(with_surface=False)
+        report["criteria"][C_UNREQ] = self.c_unreq()
         report["criteria"][C_REBUILD] = self.c_rebuild()
         report["hygiene"] = self.hygiene_report()
         fd = self.rebuild.get("forced_diagnostic")
