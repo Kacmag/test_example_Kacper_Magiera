@@ -106,19 +106,22 @@ from common import solidworks_session as SW                     # noqa: E402
 from common import harness_cli as HC                            # noqa: E402
 from common import harness_base as HB                           # noqa: E402
 from common.harness_base import (Harness, finalize,             # noqa: E402
-                                 score_error, write_env)
+                                 score_error, score_ratio, write_env)
 
 BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "3.0.0-b"
-#: /5: exact extreme points per body, the +X ray section of the housing, the
-#: raw EditRebuild3 census and the unscored forced-rebuild diagnostic.
-CAPTURE_SCHEMA = "ps3-capture/5"
-#: /4: adds the seed's structural roles, cluster geometry, grip-lobe rays and
-#: the thresholds derived from them (see derive_seed).
-BASELINE_SCHEMA = "ps-annotation-baseline/4"
+HARNESS_VERSION = "3.0.0-c"
+#: /6: engraving-scale faces of every body (area, tessellated centroid,
+#: normal), the housing's tessellated height maps and each body's X-skew,
+#: on top of /5 (exact extreme points, +X ray section of the housing, raw
+#: EditRebuild3 census, unscored forced-rebuild diagnostic).
+CAPTURE_SCHEMA = "ps3-capture/6"
+#: /5: the seed's glyph faces, height maps and skews, on top of /4 (the
+#: seed's structural roles, cluster geometry, grip-lobe rays and the
+#: thresholds derived from them -- see derive_seed).
+BASELINE_SCHEMA = "ps-annotation-baseline/5"
 
 # Metres -> millimetres, applied once, where a number is reported or scored.
 MM = 1000.0
@@ -214,9 +217,12 @@ TOL = {
     "drift_zero_mm": 5.0,        # a third of the requested change
     "span_perfect_mm": 0.5,      # housing Y/Z spans: X only is asked for
     "span_zero_mm": 5.0,
-    # -- 8 rebuild (interim: v2's fraction) --------------------------------
-    "health_perfect_frac": 0.0,
-    "health_zero_frac": 0.20,
+    # -- 8 rebuild ---------------------------------------------------------
+    # Counted, name-free: new hard errors + sketches in an error state +
+    # half of each new warning. The seed rebuilds with none, so every one is
+    # introduced by the edit; zero at 5 % of the seed's 199 features (~10)
+    # -- a tree with that many broken references is "riddled".
+    "rebuild_zero_frac": 0.05,
 }
 
 # Structural constants, each with its basis.
@@ -263,6 +269,13 @@ XSECTION_LATTICE = 3
 XSECTION_LEAD_M = 0.02
 #: A median of fewer rays than this is not read as a grip measurement.
 MIN_LOBE_RAYS = 20
+#: Engraving-scale faces: the 15 mm2 ceiling v2 used. The largest single
+#: face of an engraved letter on the seed is below it; structural faces of
+#: the housing are far above.
+GLYPH_FACE_MAX_AREA = 15e-6
+#: Height maps of the housing: 1 mm cells. The seed's lettering strokes are
+#: about 1 mm wide, and any cut worth calling a feature is wider than that.
+MAP_STEP_M = 0.001
 
 # v2 carry-overs used by the interim criteria 5 and 6.
 SMALL_FACE_AREA = 15e-6          # engraving-scale faces (m2)
@@ -748,6 +761,215 @@ def control_interference(raw, bodies, controls, housing):
             "controls": sorted(controls), "housing": list(housing)}
 
 
+def _enc(arr):
+    """float32 -> zlib -> base64: a height map in a JSON capture."""
+    import base64
+    import zlib
+    import numpy as np
+    return base64.b64encode(zlib.compress(
+        np.asarray(arr, np.float32).tobytes(), 6)).decode("ascii")
+
+
+def _dec(s, shape):
+    import base64
+    import zlib
+    import numpy as np
+    return np.frombuffer(zlib.decompress(base64.b64decode(s)),
+                         np.float32).reshape(shape).astype(np.float64)
+
+
+def _face_tris(face):
+    """IFace2::GetTessTriangles(NoConversion=True): x, y, z (m) of three
+    vertices per triangle; None when the face has no tessellation."""
+    import numpy as np
+    try:
+        t = face.GetTessTriangles(True)
+    except Exception:                                       # noqa: BLE001
+        return None
+    if not t:
+        return None
+    a = np.asarray(t, dtype=np.float64)
+    if a.size < 9 or a.size % 9:
+        return None
+    return a.reshape(-1, 3, 3)
+
+
+def _tri_area_centroid(tris):
+    import numpy as np
+    e1 = tris[:, 1] - tris[:, 0]
+    e2 = tris[:, 2] - tris[:, 0]
+    ar = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    tot = float(ar.sum())
+    if tot <= 0:
+        return None, 0.0
+    return (tris.mean(1) * ar[:, None]).sum(0) / tot, tot
+
+
+def _face_normal(face):
+    """IFace2::Normal: unit normal of a PLANAR face, (0, 0, 0) otherwise."""
+    try:
+        n = [float(v) for v in z(face.Normal)]
+        return n if any(abs(v) > 1e-9 for v in n) else None
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def body_faces(body, glyphs=True, tess=True):
+    """(glyph faces, triangles) of one body. A glyph face is [area, cx, cy,
+    cz, nx, ny, nz] (m2, m), centroid from the face's own tessellation (box
+    centre as fallback), normal zeros when the face is not planar."""
+    import numpy as np
+    out, tris_all = [], []
+    for f in (z(body.GetFaces) or []):
+        try:
+            area = float(z(f.GetArea))
+        except Exception:                                   # noqa: BLE001
+            continue
+        small = glyphs and area < GLYPH_FACE_MAX_AREA
+        tris = _face_tris(f) if (tess or small) else None
+        if tess and tris is not None:
+            tris_all.append(tris)
+        if small:
+            c = _tri_area_centroid(tris)[0] if tris is not None else None
+            if c is None:
+                try:
+                    box = z(f.GetBox)
+                    c = [(float(box[k]) + float(box[k + 3])) / 2
+                         for k in range(3)]
+                except Exception:                           # noqa: BLE001
+                    continue
+            out.append([area] + [float(v) for v in c]
+                       + (_face_normal(f) or [0.0, 0.0, 0.0]))
+    return out, (np.concatenate(tris_all) if tris_all else None)
+
+
+def surface_skew_x(tris):
+    """Area-weighted standardised third moment of a body's surface along X.
+    It flips sign under an X-mirror and ignores translation: a pointer-shaped
+    START button reads clearly non-zero, a symmetric button ~0."""
+    import numpy as np
+    if tris is None or not len(tris):
+        return None
+    e1 = tris[:, 1] - tris[:, 0]
+    e2 = tris[:, 2] - tris[:, 0]
+    ar = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    if ar.sum() <= 0:
+        return None
+    w = ar / ar.sum()
+    x = tris[:, :, 0].mean(1)
+    m = (w * x).sum()
+    m2 = (w * (x - m) ** 2).sum()
+    m3 = (w * (x - m) ** 3).sum()
+    return float(m3 / m2 ** 1.5) if m2 > 0 else 0.0
+
+
+def raster(tris, axes, hax, origin, step, shape, mode="max", batch=400000):
+    """Per grid cell, the max (or min) of coordinate `hax` over the triangles
+    covering the cell centre; NaN where none does. tris (N, 3, 3); `axes`
+    the two coordinates spanning the grid; cell (i, k) centre = origin +
+    (i + .5, k + .5) * step. Vectorised: each triangle is expanded into the
+    cells of its bounding box, tested barycentrically, max/min-accumulated."""
+    import numpy as np
+    ni, nk = shape
+    out = np.full(ni * nk, -np.inf if mode == "max" else np.inf)
+    P = tris[:, :, list(axes)].astype(np.float64)
+    H = tris[:, :, hax].astype(np.float64)
+    A = P[:, 0]
+    v0, v1 = P[:, 2] - A, P[:, 1] - A
+    d00 = (v0 * v0).sum(1)
+    d01 = (v0 * v1).sum(1)
+    d11 = (v1 * v1).sum(1)
+    den = d00 * d11 - d01 * d01
+    keep = np.abs(den) > 1e-24
+    lo, hi = P.min(1), P.max(1)
+    i0 = np.clip(np.ceil((lo[:, 0] - origin[0]) / step - 0.5),
+                 0, ni - 1).astype(np.int64)
+    i1 = np.clip(np.floor((hi[:, 0] - origin[0]) / step - 0.5),
+                 -1, ni - 1).astype(np.int64)
+    k0 = np.clip(np.ceil((lo[:, 1] - origin[1]) / step - 0.5),
+                 0, nk - 1).astype(np.int64)
+    k1 = np.clip(np.floor((hi[:, 1] - origin[1]) / step - 0.5),
+                 -1, nk - 1).astype(np.int64)
+    keep &= (i1 >= i0) & (k1 >= k0)
+    idx = np.nonzero(keep)[0]
+    cnt = ((i1 - i0 + 1) * (k1 - k0 + 1))[idx]
+    start = 0
+    while start < len(idx):
+        csum = np.cumsum(cnt[start:])
+        stop = start + max(1, int(np.searchsorted(csum, batch)))
+        t, c = idx[start:stop], cnt[start:stop]
+        rep = np.repeat(t, c)
+        j = np.arange(len(rep)) - np.repeat(np.cumsum(c) - c, c)
+        w = (i1 - i0 + 1)[rep]
+        ii = i0[rep] + j % w
+        kk = k0[rep] + j // w
+        v2x = origin[0] + (ii + 0.5) * step - A[rep, 0]
+        v2k = origin[1] + (kk + 0.5) * step - A[rep, 1]
+        d20 = v2x * v0[rep, 0] + v2k * v0[rep, 1]
+        d21 = v2x * v1[rep, 0] + v2k * v1[rep, 1]
+        dd = den[rep]
+        u = (d11[rep] * d20 - d01[rep] * d21) / dd
+        v = (d00[rep] * d21 - d01[rep] * d20) / dd
+        inside = (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1 + 1e-9)
+        hval = H[rep, 0] + u * (H[rep, 2] - H[rep, 0]) + v * (H[rep, 1]
+                                                             - H[rep, 0])
+        flat = (ii * nk + kk)[inside]
+        if mode == "max":
+            np.maximum.at(out, flat, hval[inside])
+        else:
+            np.minimum.at(out, flat, hval[inside])
+        start = stop
+    out[~np.isfinite(out)] = np.nan
+    return out.reshape(ni, nk)
+
+
+def housing_maps(tris, hext, step=None):
+    """Height maps of the housing's own tessellation, anchored at its own
+    extent minimum: top (max y) / bottom (min y) over X-Z, front (max z) /
+    back (min z) over X-Y; NaN where there is no housing."""
+    step = step or MAP_STEP_M
+    x0, y0, z0 = hext[0], hext[1], hext[2]
+    nx = int(math.ceil((hext[3] - x0) / step))
+    ny = int(math.ceil((hext[4] - y0) / step))
+    nz = int(math.ceil((hext[5] - z0) / step))
+    maps = {
+        "top": raster(tris, (0, 2), 1, (x0, z0), step, (nx, nz), "max"),
+        "bottom": raster(tris, (0, 2), 1, (x0, z0), step, (nx, nz), "min"),
+        "front": raster(tris, (0, 1), 2, (x0, y0), step, (nx, ny), "max"),
+        "back": raster(tris, (0, 1), 2, (x0, y0), step, (nx, ny), "min"),
+    }
+    return {"step_m": step, "origin_m": [x0, y0, z0],
+            "shape_xz": [nx, nz], "shape_xy": [nx, ny],
+            "triangles": int(len(tris)),
+            **{k: _enc(v) for k, v in maps.items()}}
+
+
+def capture_surfaces(raw, bodies, hids, hext):
+    """Glyph faces of every body, the housing's height maps and each
+    non-housing body's X-skew. Role-free on purpose: scoring decides which
+    bodies matter, so a role rule changed later still finds its data."""
+    import numpy as np
+    t0 = time.time()
+    glyphs, skew, htris = {}, {}, []
+    for b, rb in zip(bodies, raw):
+        is_h = b["id"] in hids
+        try:
+            g, tris = body_faces(rb, glyphs=True, tess=True)
+        except Exception:                                   # noqa: BLE001
+            g, tris = [], None
+        glyphs[b["id"]] = g
+        if is_h:
+            if tris is not None:
+                htris.append(tris)
+        else:
+            skew[b["id"]] = surface_skew_x(tris)
+    maps = None
+    if htris and hext:
+        maps = housing_maps(np.concatenate(htris), hext)
+    return {"glyph_faces": glyphs, "body_skew_x": skew, "housing_maps": maps,
+            "surfaces_seconds": round(time.time() - t0, 2)}
+
+
 # --------------------------------------------------------------------------
 # pure geometry: housing, plane, grip lobes, roles
 # --------------------------------------------------------------------------
@@ -1098,6 +1320,369 @@ def widening(xsec, hext, seed):
         "dwidth_m": dwidth}
 
 
+# --------------------------------------------------------------------------
+# text and logos: where (and which way round) does a seed engraving reappear?
+# --------------------------------------------------------------------------
+
+#: POSITION carries a face's identity; area only rules out a different
+#: feature at the same spot. Measured: the seed's own "R" regenerated in a
+#: seed-derived part keeps every face within 0.06 mm but re-trims its areas
+#: (largest face -2.5 %, slivers up to 6x), and IFace2::GetArea is documented
+#: as approximate. So a seed face matches the nearest candidate face within
+#: GLYPH_POS_TOL_M whose area is within a factor GLYPH_AREA_RATIO, credited
+#: with the smaller of the two areas; placements are proposed by faces within
+#: GLYPH_ANCHOR_TOL in area.
+GLYPH_AREA_RATIO = 2.0
+GLYPH_ANCHOR_TOL = 0.25
+#: Tessellation centroids reproduce to ~1e-3 mm; 0.3 mm admits a re-trimmed
+#: face and stays far below the 3.2 mm letter pitch of the seed's text.
+GLYPH_POS_TOL_M = 0.0003
+#: Engravings closer than this belong to one label. Measured on the seed:
+#: letters of START / SELECT sit 3.2-4.4 mm apart, the nearest other
+#: engraving is >= 9 mm from any label.
+LABEL_LINK_M = 0.0045
+#: A label is present when 90 % of its engraved area is found (a re-split
+#: of the same engraving still reaches that), absent below a quarter.
+PRESENCE_FULL, PRESENCE_ZERO = 0.90, 0.25
+#: A label that matches its own reflection this well has no handedness to
+#: read; it is excluded from the orientation check and reported.
+ACHIRAL_SELF = 0.75
+#: Surface X-skew below this is noise: the seed's mirror-symmetric buttons
+#: read |skew| <= 0.062 (their engraved symbols), its START pointer 0.252.
+SKEW_MIN = 0.10
+HYPOTHESES = ("T", "R", "Rot")
+
+
+def label_frame(F):
+    """Area-weighted centroid and unit normal of a label: the normal is the
+    smallest-variance axis of the face centroids, turned to the +Y side."""
+    import numpy as np
+    a, P = F[:, 0], F[:, 1:4]
+    c = (P * a[:, None]).sum(0) / a.sum()
+    X = (P - c) * np.sqrt(a)[:, None]
+    n = np.linalg.eigh(X.T @ X)[1][:, 0]
+    return c, (n if n[1] >= 0 else -n)
+
+
+def _hyp(rel, hyp, n):
+    import numpy as np
+    if hyp == "T":                 # moved, read the same way round
+        return rel
+    if hyp == "R":                 # what a naive X-mirror does
+        out = rel.copy()
+        out[:, 0] = -out[:, 0]
+        return out
+    return 2.0 * np.outer(rel @ n, n) - rel   # "Rot": upside down in-plane
+
+
+def register(seed, cand, anchors=3):
+    """{hyp: {"fraction", "centroid_m", "matched"}}: the largest share of a
+    seed label's engraved AREA found among `cand` faces under each
+    hypothesis, and where its centroid lands. Each candidate face of
+    matching area proposes a placement for one of the label's largest faces;
+    the placement explaining the most area wins."""
+    import numpy as np
+    seed, cand = np.asarray(seed, float), np.asarray(cand, float)
+    out = {hy: {"fraction": 0.0, "centroid_m": None, "matched": 0}
+           for hy in HYPOTHESES}
+    if not len(seed) or not len(cand):
+        return out
+    a_s, P = seed[:, 0], seed[:, 1:4]
+    c, n = label_frame(seed)
+    rel = P - c
+    A = a_s.sum()
+    a_c, Q = cand[:, 0], cand[:, 1:4]
+    ratio = a_c[None, :] / np.maximum(a_s[:, None], 1e-30)
+    anchor_ok = np.abs(ratio - 1.0) <= GLYPH_ANCHOR_TOL
+    area_ok = (ratio <= GLYPH_AREA_RATIO) & (ratio >= 1.0 / GLYPH_AREA_RATIO)
+    big_first = np.argsort(-a_s, kind="stable")
+    for hy in HYPOTHESES:
+        relH = _hyp(rel, hy, n)
+        best, tried = out[hy], set()
+        for i in big_first[:anchors]:
+            for j in np.nonzero(anchor_ok[i])[0]:
+                origin = Q[j] - relH[i]
+                key = tuple(np.round(origin / GLYPH_POS_TOL_M).astype(int))
+                if key in tried:
+                    continue
+                tried.add(key)
+                d = np.linalg.norm((origin + relH)[:, None, :] - Q[None],
+                                   axis=2)
+                ok = area_ok & (d <= GLYPH_POS_TOL_M)
+                used, got, cnt = set(), 0.0, 0
+                for s in big_first:
+                    js = np.nonzero(ok[s])[0]
+                    for jj in js[np.argsort(d[s, js], kind="stable")]:
+                        if int(jj) not in used:
+                            used.add(int(jj))
+                            got += min(a_s[s], a_c[jj])
+                            cnt += 1
+                            break
+                if got / A > best["fraction"] + 1e-12:
+                    best.update(fraction=float(got / A),
+                                centroid_m=origin.tolist(), matched=cnt)
+    return out
+
+
+def _clusters(F, link):
+    """Single-linkage groups of glyph faces by centroid distance."""
+    import numpy as np
+    n = len(F)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    P = F[:, 1:4]
+    d = np.linalg.norm(P[:, None] - P[None], axis=2)
+    for i, j in zip(*np.nonzero(np.triu(d <= link, 1))):
+        parent[find(int(i))] = find(int(j))
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return [sorted(g) for g in groups.values()]
+
+
+def _glyphs(capture, ids):
+    import numpy as np
+    rows = [f for i in ids for f in ((capture.get("glyph_faces") or {})
+                                      .get(i) or [])]
+    return np.asarray(rows, float).reshape(-1, 7)
+
+
+def seed_labels(baseline):
+    """The seed's text labels and logos, located by structure, with their
+    faces and handedness. Text: the engraving cluster nearest each centre
+    button (outside the button's own footprint) and the one above each
+    bumper. Logos: each face button's engraving."""
+    import numpy as np
+    seed = baseline["seed"]
+    by = {b["id"]: b for b in baseline["bodies"]}
+    F = _glyphs(baseline, seed["roles"]["housing"])
+    groups = _clusters(F, LABEL_LINK_M)
+    cents = [(F[g][:, 1:4] * F[g][:, :1]).sum(0) / F[g][:, 0].sum()
+             for g in groups]
+
+    def nearest(x, z, exclude=None):
+        best = None
+        for g, c in zip(groups, cents):
+            if exclude and exclude(c):
+                continue
+            d = math.hypot(c[0] - x, c[2] - z)
+            if best is None or d < best[0]:
+                best = (d, g)
+        return best[1] if best else []
+
+    labels = {}
+    for role, name in (("select", "SELECT"), ("start", "START")):
+        b = by[seed["roles"][role][0]]
+        e = extent_of(b)
+
+        def inside(c, e=e):
+            return (e[0] - 0.001 <= c[0] <= e[3] + 0.001
+                    and e[2] - 0.001 <= c[2] <= e[5] + 0.001)
+        labels[name] = F[nearest(b["centroid_m"][0], b["centroid_m"][2],
+                                 inside)]
+    for bid in seed["roles"]["bumpers"]:
+        b = by[bid]
+        name = "R" if b["centroid_m"][0] > seed["plane_x_m"] else "L"
+        labels[name] = F[nearest(b["centroid_m"][0], b["centroid_m"][2])]
+    fb = seed["clusters"]["face_buttons"]
+    cx = seed["plane_x_m"] + fb["u_m"]
+    symbols = {}
+    for bid in seed["roles"]["face_buttons"]:
+        g = _glyphs(baseline, [bid])
+        if not len(g):
+            continue
+        c = by[bid]["centroid_m"]
+        symbols[bid] = {"faces": g, "du_m": c[0] - cx,
+                        "dz_m": c[2] - fb["z_m"]}
+    out = {"text": {}, "symbols": {}}
+    for name, g in labels.items():
+        self_r = register(g, g)
+        out["text"][name] = {
+            "faces": g, "area_m2": float(g[:, 0].sum()) if len(g) else 0.0,
+            "centroid_m": label_frame(g)[0].tolist() if len(g) else None,
+            "self_R": self_r["R"]["fraction"],
+            "self_Rot": self_r["Rot"]["fraction"],
+            "chiral": max(self_r["R"]["fraction"],
+                          self_r["Rot"]["fraction"]) < ACHIRAL_SELF}
+    for bid, s in symbols.items():
+        self_r = register(s["faces"], s["faces"])
+        out["symbols"][bid] = {**s, "area_m2": float(s["faces"][:, 0].sum()),
+                               "chiral": max(self_r["R"]["fraction"],
+                                             self_r["Rot"]["fraction"])
+                               < ACHIRAL_SELF}
+    sk = (baseline.get("body_skew_x") or {}).get(seed["roles"]["start"][0])
+    out["start_skew"] = sk
+    out["clusters"] = [len(g) for g in groups]
+    # The seed's letter pitch: adjacent letter faces of START / SELECT along
+    # X (island faces inside A and R, under a quarter of the median letter,
+    # are not letters).
+    gaps = []
+    for name in ("START", "SELECT"):
+        F = labels[name]
+        if len(F) < 2:
+            continue
+        med = float(np.median(F[:, 0]))
+        xs = sorted(F[F[:, 0] >= 0.25 * med][:, 1])
+        gaps += [b - a for a, b in zip(xs, xs[1:])]
+    out["letter_pitch_m"] = min(gaps) if gaps else None
+    return out
+
+
+# --------------------------------------------------------------------------
+# housing surface: height maps compared under the widening warp
+# --------------------------------------------------------------------------
+
+#: Beside the seam where the widening inserts material.
+SEAM_MARGIN_M = 0.002
+#: Around every feature the conversion swaps (one map cell is 1 mm).
+MASK_DILATE_M = 0.002
+#: Steeper than 45 deg, a sub-cell lateral shift reads as a height change.
+SLOPE_MAX = 1.0
+#: Cells this close to a silhouette are not compared (sampling there is
+#: unstable by half a cell either way).
+EDGE_CELLS = 2
+MAP_VIEWS = (("top", "shape_xz", 2), ("bottom", "shape_xz", 2),
+             ("front", "shape_xy", 1), ("back", "shape_xy", 1))
+
+
+def _bilinear(m, fi, fk):
+    """m sampled at fractional cell indices; NaN if any of the four
+    neighbours is NaN or outside the map."""
+    import numpy as np
+    ni, nk = m.shape
+    i0 = np.floor(fi).astype(int)
+    k0 = np.floor(fk).astype(int)
+    out = np.full(fi.shape, np.nan)
+    ok = (i0 >= 0) & (k0 >= 0) & (i0 + 1 < ni) & (k0 + 1 < nk)
+    i, k = i0[ok], k0[ok]
+    t1, t2 = (fi - i0)[ok], (fk - k0)[ok]
+    out[ok] = (m[i, k] * (1 - t1) * (1 - t2) + m[i + 1, k] * t1 * (1 - t2)
+               + m[i, k + 1] * (1 - t1) * t2 + m[i + 1, k + 1] * t1 * t2)
+    return out
+
+
+def _dilate(mask, r):
+    import numpy as np
+    out = mask.copy()
+    for ax in (0, 1):
+        acc = out.copy()
+        for s in range(1, r + 1):
+            acc |= np.roll(out, s, axis=ax) | np.roll(out, -s, axis=ax)
+        out = acc
+    return out
+
+
+def seed_swap_mask(m, x0, step, plane, t):
+    """Cells where the seed differs from its own mirror image by more than t
+    (or where only one side is housing), mirrored onto both sides and
+    dilated: exactly the features a left-hand conversion swaps."""
+    import numpy as np
+    ni, nk = m.shape
+    xs = x0 + (np.arange(ni) + 0.5) * step
+    fi = np.repeat((((2 * plane - xs) - x0) / step - 0.5)[:, None], nk, 1)
+    fk = np.repeat(np.arange(nk, dtype=float)[None, :], ni, 0)
+    mir = _bilinear(m, fi, fk)
+    fin, finm = np.isfinite(m), np.isfinite(mir)
+    asym = (fin & finm & (np.abs(m - mir) > t)) | (fin ^ finm)
+    asym |= np.nan_to_num(_bilinear(asym.astype(float), fi, fk)) > 0
+    return _dilate(asym, int(round(MASK_DILATE_M / step)))
+
+
+def compare_view(seed_m, s_x0, s_k0, cand_m, c_x0, c_k0, step, plane_s,
+                 plane_c, h, t, swap):
+    """Deviation cells of one candidate view against the seed's, the seed
+    warped by the candidate's own half-widening h. Masked: the seam strip,
+    swapped features (anywhere between their mirrored position and h further
+    out), steep cells and silhouette bands."""
+    import numpy as np
+    ni, nk = cand_m.shape
+    uc = c_x0 + (np.arange(ni) + 0.5) * step - plane_c
+    xs = plane_s + uc - np.sign(uc) * h
+    fi = np.repeat(((xs - s_x0) / step - 0.5)[:, None], nk, 1)
+    kc = c_k0 + (np.arange(nk) + 0.5) * step
+    fk = np.repeat(((kc - s_k0) / step - 0.5)[None, :], ni, 0)
+    s = _bilinear(seed_m, fi, fk)
+    gx, gk = np.gradient(np.nan_to_num(seed_m, nan=0.0), step)
+    slope = _bilinear(np.hypot(gx, gk), fi, fk)
+    sm = np.zeros((ni, nk), bool)
+    span = int(np.ceil(abs(h) / step)) + 1
+    swf = swap.astype(float)
+    for j in range(-span, span + 1):
+        sm |= np.nan_to_num(_bilinear(swf, fi + j, fk)) > 0
+    seam = np.repeat((np.abs(uc) <= abs(h) + SEAM_MARGIN_M)[:, None], nk, 1)
+    fc, fs = np.isfinite(cand_m), np.isfinite(s)
+    edge = _dilate(~fc | ~fs, EDGE_CELLS)
+    excluded = seam | sm | edge
+    dev = ((fc & fs & (np.abs(cand_m - s) > t) & (slope <= SLOPE_MAX))
+           | (fc ^ fs)) & ~excluded
+    return dev, {"compared": int((~excluded & (fc | fs)).sum()),
+                 "masked": int(excluded.sum()),
+                 "deviation_cells": int(dev.sum())}
+
+
+#: The noise floor is this percentile of the seed's own left/right map
+#: differences: 1 cell in 100 of the seed's symmetric surface differs from
+#: its mirror by more (tessellation and half-cell interpolation on slopes).
+MAP_NOISE_PERCENTILE = 99.0
+
+
+def seed_map_scales(baseline, view="top"):
+    """(t, A_letter, info), all read off the seed:
+      engraving depth -- the shallowest engraved label (R / L) on its top
+          map: what the seed itself calls a deliberate feature;
+      t -- MAP_NOISE_PERCENTILE of |map - mirror(map)| over the seed's
+          symmetric surface (differences shallower than that engraving, on
+          the cells the comparison reads): the method's own noise, since
+          the two halves are tessellated independently;
+      A_letter -- the median letter face of START / SELECT (one face per
+          letter there; the median skips the islands inside A and R).
+    A deviation within the noise, or smaller than one letter, is not a
+    change."""
+    import numpy as np
+    hm = baseline["housing_maps"]
+    step = hm["step_m"]
+    top = _dec(hm["top"], hm["shape_xz"])
+    x0, z0 = hm["origin_m"][0], hm["origin_m"][2]
+    sl = seed_labels(baseline)
+    depths = []
+    for name in ("R", "L"):
+        F = sl["text"][name]["faces"]
+        lo, hi = F[:, 1:4].min(0), F[:, 1:4].max(0)
+        i0, i1 = (int((v - x0) / step) for v in (lo[0], hi[0]))
+        k0, k1 = (int((v - z0) / step) for v in (lo[2], hi[2]))
+        box = top[i0:i1 + 1, k0:k1 + 1]
+        ring = top[max(0, i0 - 4):i1 + 5, max(0, k0 - 4):k1 + 5]
+        if np.isfinite(box).any() and np.isfinite(ring).any():
+            depths.append(float(np.nanmedian(ring) - np.nanmin(box)))
+    depth = min(depths) if depths else 0.0005
+    shp = "shape_xz" if view in ("top", "bottom") else "shape_xy"
+    m = _dec(hm[view], hm[shp])
+    ni, nk = m.shape
+    plane = baseline["seed"]["plane_x_m"]
+    xs = hm["origin_m"][0] + (np.arange(ni) + 0.5) * step
+    fi = np.repeat((((2 * plane - xs) - hm["origin_m"][0]) / step
+                    - 0.5)[:, None], nk, 1)
+    fk = np.repeat(np.arange(nk, dtype=float)[None, :], ni, 0)
+    mir = _bilinear(m, fi, fk)
+    gx, gk = np.gradient(np.nan_to_num(m, nan=0.0), step)
+    keep = (np.isfinite(m) & np.isfinite(mir)
+            & (np.hypot(gx, gk) <= SLOPE_MAX)
+            & ~_dilate(~np.isfinite(m) | ~np.isfinite(mir), EDGE_CELLS))
+    d = np.abs(m - mir)[keep]
+    d = d[d < depth]
+    t = float(np.percentile(d, MAP_NOISE_PERCENTILE)) if len(d) else depth
+    letters = [f[0] for name in ("START", "SELECT")
+               for f in sl["text"][name]["faces"]]
+    a = statistics.median(letters) if letters else None
+    return t, a, {"engraving_depth_m": depth, "label_depths_m": depths,
+                  "noise_cells": int(len(d))}
+
+
 def candidate_roles(bodies, plane, seed, h):
     """A candidate's roles. Kept bodies by seed fingerprint; clusters by
     structure; START/SELECT by scale-invariant shape near the seed's centre
@@ -1233,6 +1818,7 @@ def capture(doc, baseline=None):
                       | {i for g in rdiag.get("duplicate_clusters", [])
                          for i in g})
     intf = control_interference(raw, bodies, controls, hids)
+    surfaces = capture_surfaces(raw, bodies, hids, hext)
     title = str(z(doc.GetTitle))
     modelling = SC.modelling_census(doc)
     # LAST, because it mutates the geometry everything above has measured.
@@ -1255,6 +1841,7 @@ def capture(doc, baseline=None):
         "small_face_counts": smf,
         "light_cluster": lights,
         "interference": intf,
+        **surfaces,
     }
 
 
@@ -1290,6 +1877,31 @@ def rebuild_delta(rb, baseline):
     return rb
 
 
+def translate_yz(measured, dy, dz):
+    """A copy of a capture moved by (0, dy, dz): bodies, extents, glyph
+    faces and map origins. X needs no such step -- everything along X is
+    read relative to the part's own mirror plane."""
+    import copy
+    out = copy.deepcopy(measured)
+    for b in out.get("bodies", []):
+        b["centroid_m"] = [b["centroid_m"][0], b["centroid_m"][1] + dy,
+                           b["centroid_m"][2] + dz]
+        for key in ("extent_m", "bbox_m"):
+            e = b.get(key)
+            if e and len(e) == 6:
+                b[key] = [e[0], e[1] + dy, e[2] + dz, e[3], e[4] + dy,
+                          e[5] + dz]
+    for rows in (out.get("glyph_faces") or {}).values():
+        for r in rows:
+            r[2] += dy
+            r[3] += dz
+    hm = out.get("housing_maps")
+    if hm:
+        o = hm["origin_m"]
+        hm["origin_m"] = [o[0], o[1] + dy, o[2] + dz]
+    return out
+
+
 def ungradable_reason(baseline, measured):
     """Why this candidate cannot be measured at all, or None. Distinct from
     measured-and-wrong: both end at 0, only this one says why."""
@@ -1315,6 +1927,21 @@ class Grader:
         self.notes = []
         self.hids = housing_ids(measured["bodies"])
         self.hext = union_extent(measured["bodies"], self.hids)
+        # Y / Z: a part whose origin was reset in Y or Z is read in its own
+        # frame, aligned on the housing's extent minimum (the requested edit
+        # moves nothing in Y or Z; the Y/Z spans are checked in #7).
+        sh = self.seed["housing_extent_m"]
+        dy, dz = sh[1] - self.hext[1], sh[2] - self.hext[2]
+        self.yz_shift_mm = [round(dy * MM, 3), round(dz * MM, 3)]
+        if max(abs(dy), abs(dz)) > 1e-6:
+            measured = translate_yz(measured, dy, dz)
+            self.ms = measured
+            self.C = {b["id"]: b for b in measured["bodies"]}
+            self.hext = union_extent(measured["bodies"], self.hids)
+            if max(abs(dy), abs(dz)) * MM > 0.05:
+                self.notes.append(f"housing frame offset {self.yz_shift_mm}"
+                                  " mm (y, z) from the seed's; read in its "
+                                  "own frame")
         xsec = measured.get("xsection")
         if xsec and xsec.get("error"):
             self.notes.append(f"ray section unavailable: {xsec['error']}")
@@ -1327,9 +1954,30 @@ class Grader:
                               "from the body X extent instead")
         self.roles, self.rdiag = candidate_roles(measured["bodies"], self.P,
                                                  self.seed, self.h)
+        self._lab = None
 
     def u(self, i):
         return self.C[i]["centroid_m"][0] - self.P
+
+    def label_results(self):
+        """(seed labels, text registrations, symbol registrations), once."""
+        if self._lab is None:
+            sl = seed_labels(self.bl)
+            Fh = _glyphs(self.ms, self.hids)
+            Ff = _glyphs(self.ms, self.roles.get("face_buttons") or [])
+            self._lab = (
+                sl,
+                {name: register(L["faces"], Fh)
+                 for name, L in sl["text"].items()},
+                {bid: register(S["faces"], Ff)
+                 for bid, S in sl["symbols"].items()})
+        return self._lab
+
+    @staticmethod
+    def symbol_name(s):
+        if abs(s["du_m"]) >= abs(s["dz_m"]):
+            return "symbol left" if s["du_m"] < 0 else "symbol right"
+        return "symbol top" if s["dz_m"] < 0 else "symbol bottom"
 
     # -- 1 ---------------------------------------------------------------
     def c_width(self):
@@ -1474,34 +2122,48 @@ class Grader:
                             "place) scores 0"}
 
     # -- 4 ---------------------------------------------------------------
-    def c_stsel(self):
-        h = self.h
+    def _band_score(self, uc, us, perfect_mm):
+        """Distance of u from the mirrored band [mirror(u_seed), mirror +
+        h outboard] scored to zero at |u_seed| (not across the plane)."""
+        lo, hi = sorted((-us, -us + sgn(-us) * self.h))
+        d = 0.0 if lo <= uc <= hi else min(abs(uc - lo), abs(uc - hi))
+        return (score_error(d * MM, perfect_mm, abs(us) * MM),
+                {"u_mm": round(uc * MM, 2),
+                 "band_mm": [round(lo * MM, 2), round(hi * MM, 2)],
+                 "outside_band_mm": round(d * MM, 3)})
+
+    def c_stsel(self, with_text=True):
         parts, det = {}, {}
         for role in ("select", "start"):
             rec = self.seed["centre"][role]
             ids = self.roles.get(role) or []
             if not ids:
-                parts[role] = 0.0
-                det[role] = {"missing": True}
+                parts[f"{role} button"] = 0.0
+                det[f"{role} button"] = {"missing": True}
                 continue
-            uc = self.u(ids[0])
-            us = rec["u_m"]
-            lo, hi = sorted((-us, -us + sgn(-us) * h))
-            d = 0.0 if lo <= uc <= hi else min(abs(uc - lo), abs(uc - hi))
-            parts[role] = score_error(d * MM, TOL["stsel_perfect_mm"],
-                                      abs(us) * MM)
-            det[role] = {"u_mm": round(uc * MM, 2),
-                         "band_mm": [round(lo * MM, 2), round(hi * MM, 2)],
-                         "outside_band_mm": round(d * MM, 3),
-                         "dy_mm_reported": round(
-                             (self.C[ids[0]]["centroid_m"][1] - rec["y_m"])
-                             * MM, 3)}
+            s, d = self._band_score(self.u(ids[0]), rec["u_m"],
+                                    TOL["stsel_perfect_mm"])
+            d["dy_mm_reported"] = round(
+                (self.C[ids[0]]["centroid_m"][1] - rec["y_m"]) * MM, 3)
+            parts[f"{role} button"], det[f"{role} button"] = s, d
+        if with_text and self.bl.get("glyph_faces") \
+                and self.ms.get("glyph_faces"):
+            sl = self.label_results()[0]
+            pitch = sl.get("letter_pitch_m")
+            for name, uc in self.text_positions().items():
+                us = sl["text"][name]["centroid_m"][0] - self.seed["plane_x_m"]
+                # A label is placed to one letter: a shift under the seed's
+                # smallest letter pitch leaves it by the same button.
+                s, d = self._band_score(uc, us, (pitch or 0.0005) * MM)
+                d["perfect_mm"] = round((pitch or 0.0005) * MM, 3)
+                parts[f"{name} text"], det[f"{name} text"] = s, d
         score = mean(parts.values())
         return {"score": round(score, 4), "status": status_of(score),
+                "components": {k: round(v, 4) for k, v in parts.items()},
                 "detail": det,
-                "evidence": "START and SELECT buttons at the mirror of their "
-                            "seed positions (carried outboard by up to h is "
-                            "also mirrored); the text labels join in stage D"}
+                "evidence": "START and SELECT buttons (and their text, where "
+                            "present) at the mirror of their seed positions; "
+                            "carried outboard by up to h is also mirrored"}
 
     # -- 5 (interim) -----------------------------------------------------
     def c_orient(self):
@@ -1520,32 +2182,197 @@ class Grader:
                             "'R' shoulder label stays on its side; stage D "
                             "replaces it with label registration"}
 
-    # -- 6 (interim) -----------------------------------------------------
-    def c_kept(self):
-        smf_b = self.bl.get("small_face_counts") or {}
-        smf_c = self.ms.get("small_face_counts") or {}
-        bids = self.seed["roles"]["face_buttons"]
-        cids = self.roles.get("face_buttons") or []
-        b_total = sum(smf_b.get(i, 0) for i in bids)
-        if not b_total:
+    # -- 5 (stage D) -----------------------------------------------------
+    def c_orient_labels(self):
+        """Every readable text label must read the seed's way round, the
+        face-button symbols must keep their arrangement, and the START
+        pointer must point the seed's way. The weakest item decides."""
+        if not (self.bl.get("glyph_faces") and self.ms.get("glyph_faces")):
             return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
-                    "evidence": "seed face buttons carry no engraving"}
-        if len(cids) != 4:
-            return {"score": 0.0, "status": FAIL,
-                    "evidence": "INTERIM (stage B): no face-button cluster "
-                                "to read the symbols on"}
-        c_total = sum(smf_c.get(i, 0) for i in cids)
-        retained = c_total / float(b_total)
-        s = clamp01(retained / MARKINGS_FULL_FRACTION)
+                    "evidence": "no engraving faces in the baseline or the "
+                                "capture (re-capture with ps3-capture/6)"}
+        sl, text, sym = self.label_results()
+        items, skipped, det = {}, {}, {}
+        # A reading wins clearly once it explains this much more of the label
+        # than the alternatives: half the smallest margin by which a seed
+        # label's own reading beats its own mirror / rotation (SELECT: 0.5).
+        # Partly missing engraving lowers both readings alike, so it is
+        # charged once -- by criterion 6 -- and not again here.
+        margin = 0.5 * min((1.0 - max(L["self_R"], L["self_Rot"]))
+                           for L in sl["text"].values() if L["chiral"])
+        for name, r in text.items():
+            fr = {hy: round(r[hy]["fraction"], 4) for hy in HYPOTHESES}
+            det[f"text {name}"] = fr
+            if not sl["text"][name]["chiral"]:
+                skipped[f"text {name}"] = "achiral: matches its own mirror"
+                continue
+            if max(fr.values()) < PRESENCE_ZERO:
+                skipped[f"text {name}"] = "absent (criterion 6 charges it)"
+                continue
+            items[f"text {name}"] = clamp01(
+                0.5 + (fr["T"] - max(fr["R"], fr["Rot"])) / (2 * margin))
+        det["reading_margin"] = round(margin, 4)
+        fb = self.roles.get("face_buttons") or []
+        if len(fb) == 4:
+            ccx = mean(self.C[i]["centroid_m"][0] for i in fb)
+            rad = self.seed["clusters"]["face_buttons"]["radius_m"]
+            for bid, S in sl["symbols"].items():
+                r = sym[bid]
+                name = self.symbol_name(S)
+                best = max(HYPOTHESES, key=lambda hy: r[hy]["fraction"])
+                if r[best]["fraction"] < PRESENCE_ZERO:
+                    skipped[name] = "absent (criterion 6 charges it)"
+                    continue
+                if abs(S["du_m"]) > abs(S["dz_m"]):
+                    # unambiguously on one side beyond half a button offset
+                    du = r[best]["centroid_m"][0] - ccx
+                    items[f"{name} side"] = clamp01(
+                        0.5 + sgn(S["du_m"]) * du / rad)
+                    det[f"{name} side"] = {"seed_du_mm": round(S["du_m"] * MM,
+                                                               2),
+                                           "du_mm": round(du * MM, 2)}
+                if S["chiral"]:
+                    fr = {hy: r[hy]["fraction"] for hy in HYPOTHESES}
+                    items[f"{name} reading"] = clamp01(
+                        0.5 + (fr["T"] - max(fr["R"], fr["Rot"]))
+                        / (2 * margin))
+                    det[f"{name} reading"] = {k: round(v, 4)
+                                              for k, v in fr.items()}
+        s_seed = sl.get("start_skew")
+        st = self.roles.get("start") or []
+        if s_seed is not None and abs(s_seed) >= SKEW_MIN and st:
+            s_c = (self.ms.get("body_skew_x") or {}).get(st[0])
+            if s_c is not None:
+                # WHICH WAY it points, not how sharply: a rebuilt pointer may
+                # be blunter (the reference's reads 0.139 against the seed's
+                # 0.252, same sign). Full credit from SKEW_MIN (the seed's
+                # noise floor) the seed's way, none from SKEW_MIN the other.
+                items["START pointer"] = clamp01(
+                    0.5 + sgn(s_seed) * s_c / (2 * SKEW_MIN))
+                det["START pointer"] = {"seed_skew": round(s_seed, 4),
+                                        "skew": round(s_c, 4)}
+        if not items:
+            return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
+                    "detail": {"skipped": skipped},
+                    "evidence": "no chiral label could be read"}
+        s = min(items.values())
+        worst = min(items, key=items.get)
         return {"score": round(s, 4), "status": status_of(s),
-                "detail": {"seed_engraved_faces": b_total,
-                           "candidate_engraved_faces": c_total},
-                "evidence": f"INTERIM (stage B): {c_total} of the seed's "
-                            f"{b_total} engraving-scale faces on the face "
-                            f"buttons ({retained:.0%})"}
+                "components": {k: round(v, 4) for k, v in items.items()},
+                "detail": {"fractions": det, "skipped": skipped},
+                "evidence": f"each label placed on the candidate as moved "
+                            f"(T), mirrored (R) or upside down (Rot); the "
+                            f"weakest item decides -- {worst}"}
+
+    def text_positions(self):
+        """{START, SELECT: candidate u (m)} of the text labels, from their
+        best registration; absent labels are left to criterion 6."""
+        if not (self.bl.get("glyph_faces") and self.ms.get("glyph_faces")):
+            return {}
+        sl, text, _ = self.label_results()
+        out = {}
+        for name in ("START", "SELECT"):
+            r = text.get(name)
+            if not r:
+                continue
+            best = max(HYPOTHESES, key=lambda hy: r[hy]["fraction"])
+            if r[best]["fraction"] >= PRESENCE_ZERO:
+                out[name] = r[best]["centroid_m"][0] - self.P
+        return out
+
+    # -- 6 ---------------------------------------------------------------
+    def c_kept(self):
+        if not (self.bl.get("glyph_faces") and self.ms.get("glyph_faces")):
+            return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
+                    "evidence": "no engraving faces in the baseline or the "
+                                "capture (re-capture with ps3-capture/6)"}
+        sl, text, sym = self.label_results()
+        items = {}
+        for name, r in text.items():
+            f = max(r[hy]["fraction"] for hy in HYPOTHESES)
+            items[f"text {name}"] = f
+        for bid, r in sym.items():
+            f = max(r[hy]["fraction"] for hy in HYPOTHESES)
+            items[self.symbol_name(sl["symbols"][bid])] = f
+        scores = {k: score_ratio(f, PRESENCE_FULL, PRESENCE_ZERO)
+                  for k, f in items.items()}
+        s = min(scores.values()) if scores else NEUTRAL_UNVERIFIABLE
+        worst = min(scores, key=scores.get) if scores else None
+        return {"score": round(s, 4), "status": status_of(s),
+                "components": {k: round(v, 4) for k, v in scores.items()},
+                "detail": {"engraved_area_found": {k: round(f, 4)
+                                                   for k, f in items.items()},
+                           "seed_label_faces": {
+                               k: len(v["faces"])
+                               for k, v in sl["text"].items()}},
+                "evidence": f"share of each seed label's engraved area found "
+                            f"again on the candidate (any orientation); the "
+                            f"weakest decides -- {worst}: "
+                            f"{items.get(worst, 0):.0%}"}
+
+    # -- 7 (housing surface) ---------------------------------------------
+    def surface_deviation(self):
+        """Housing height maps against the seed's, warped by this part's own
+        widening. SCORED: the top view -- the controller's visible face, where
+        every requested edit and every label lives -- with each control's
+        plan footprint masked (the housing under a control is its seat; the
+        reference rebuilds those). REPORTED: bottom, front, back, which the
+        reference itself changes (shoulder openings, rear LED windows, the
+        shell parting line). Added hardware is not masked, so adding a body
+        cannot hide a cut."""
+        import numpy as np
+        sm, cm = self.bl.get("housing_maps"), self.ms.get("housing_maps")
+        if not (sm and cm):
+            return None
+        plane_s = self.seed["plane_x_m"]
+        step = sm["step_m"]
+        controls = [i for r in CONTROL_ROLES for i in self.roles.get(r, [])]
+        out = {"views": {}}
+        for view, shp, kax in MAP_VIEWS:
+            t, a_letter, info = seed_map_scales(self.bl, view)
+            if view == "top":
+                out.update({"t_mm": round(t * MM, 4),
+                            "a_letter_mm2": round(a_letter * 1e6, 3),
+                            "seed_engraving_depth_mm": round(
+                                info["engraving_depth_m"] * MM, 3)})
+            S = _dec(sm[view], sm[shp])
+            C = _dec(cm[view], cm[shp])
+            swap = seed_swap_mask(S, sm["origin_m"][0], step, plane_s, t)
+            dev, st = compare_view(S, sm["origin_m"][0], sm["origin_m"][kax],
+                                   C, cm["origin_m"][0], cm["origin_m"][kax],
+                                   step, plane_s, self.P, self.h, t, swap)
+            if view == "top":
+                ni, nk = C.shape
+                xs = cm["origin_m"][0] + (np.arange(ni) + 0.5) * step
+                zs = cm["origin_m"][2] + (np.arange(nk) + 0.5) * step
+                foot = np.zeros((ni, nk), bool)
+                pad = MASK_DILATE_M
+                for i in controls:
+                    e = extent_of(self.C[i])
+                    if e:
+                        foot |= np.outer((xs >= e[0] - pad) & (xs <= e[3] + pad),
+                                         (zs >= e[2] - pad) & (zs <= e[5] + pad))
+                dev = dev & ~foot
+                st["deviation_cells"] = int(dev.sum())
+                st["control_footprint_cells"] = int(foot.sum())
+            st["area_mm2"] = round(st["deviation_cells"] * (step * MM) ** 2, 1)
+            if st["deviation_cells"]:
+                ii, kk = np.nonzero(dev)
+                u = cm["origin_m"][0] + (ii + 0.5) * step - self.P
+                kv = cm["origin_m"][kax] + (kk + 0.5) * step
+                st["where_u_mm"] = [round(u.min() * MM), round(u.max() * MM)]
+                st[f"where_{'z' if kax == 2 else 'y'}_mm"] = [
+                    round(kv.min() * MM), round(kv.max() * MM)]
+            st["scored"] = view == "top"
+            st["t_mm"] = round(t * MM, 4)
+            out["views"][view] = st
+        out["scored_area_mm2"] = out["views"]["top"]["area_mm2"]
+        a_mm2 = out["a_letter_mm2"]
+        out["score"] = score_error(out["scored_area_mm2"], a_mm2, 10 * a_mm2)
+        return out
 
     # -- 7 ---------------------------------------------------------------
-    def c_unreq(self):
+    def c_unreq(self, with_surface=True):
         parts, det = {}, {}
         worst_fp, worst_drift, missing = 0.0, 0.0, []
         for role in KEPT_ROLES:
@@ -1570,6 +2397,11 @@ class Grader:
                    abs((self.hext[5] - self.hext[2]) - (sh[5] - sh[2]))) * MM
         parts["housing_yz_spans"] = score_error(span, TOL["span_perfect_mm"],
                                                 TOL["span_zero_mm"])
+        if with_surface:
+            surf = self.surface_deviation()
+            if surf is not None:
+                parts["housing_surface"] = surf["score"]
+                det["housing_surface"] = surf
         det.update({"worst_fingerprint_distance": round(worst_fp, 5),
                     "worst_yz_drift_mm": round(worst_drift, 3),
                     "missing_kept_roles": missing,
@@ -1585,23 +2417,43 @@ class Grader:
                             "spans. Added hardware is reported, not scored. "
                             "Housing surface comparison arrives in stage E"}
 
-    # -- 8 (interim) -----------------------------------------------------
+    # -- 8 ---------------------------------------------------------------
     def c_rebuild(self):
-        rb = self.rebuild
-        n_feat = rb.get("features") or 0
-        broken = rb.get("errors")
-        if broken is None:
+        census = self.rebuild.get("census")
+        if census is None:
             return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
-                    "evidence": "no rebuild census available"}
-        frac = (broken / n_feat) if n_feat else (1.0 if broken else 0.0)
-        s = score_error(frac, TOL["health_perfect_frac"],
-                        TOL["health_zero_frac"])
+                    "evidence": "no rebuild census in the capture"}
+        seed_c = (self.bl.get("rebuild") or {}).get("feature_errors") or {}
+
+        def counts(c):
+            return (sum(1 for v in c.values() if not v[1]),
+                    sum(1 for v in c.values() if v[1]))
+
+        def sketch_errors(model):
+            st = (((model or {}).get("sketches") or {})
+                  .get("status_counts") or {})
+            # swConstrainedStatus_e: 4 over-, 5 no solution, 6 invalid
+            return sum(int(v) for k, v in st.items() if k in ("4", "5", "6"))
+        hc, wc = counts(census)
+        hs, ws = counts(seed_c)
+        skc = sketch_errors(self.ms.get("modelling"))
+        sks = sketch_errors(self.bl.get("modelling"))
+        n = (max(0, hc - hs) + max(0, skc - sks) + 0.5 * max(0, wc - ws))
+        feats = (self.bl.get("rebuild") or {}).get("features") or 199
+        zero = TOL["rebuild_zero_frac"] * feats
+        s = score_error(n, 0.0, zero)
         return {"score": round(s, 4), "status": status_of(s),
-                "detail": {"newly_broken": broken, "features": n_feat,
-                           "broken_features": rb.get("broken_features",
-                                                     [])[:10]},
-                "evidence": "INTERIM (stage B): fraction of features newly "
-                            "broken after EditRebuild3 vs the seed census"}
+                "detail": {"new_hard_errors": max(0, hc - hs),
+                           "new_sketch_errors": max(0, skc - sks),
+                           "new_warnings": max(0, wc - ws),
+                           "weighted_count": n, "zero_at": round(zero, 2),
+                           "failing_features_reported": sorted(
+                               k for k, v in census.items())[:20]},
+                "evidence": f"{max(0, hc - hs)} new failing feature(s), "
+                            f"{max(0, skc - sks)} sketch(es) in an error "
+                            f"state, {max(0, wc - ws)} new warning(s) after "
+                            f"EditRebuild3 (counted, not matched by name); "
+                            f"zero at {zero:.1f}"}
 
     def hygiene_report(self):
         """Report only (decision: tree structure is not graded)."""
@@ -1632,10 +2484,11 @@ class Grader:
         report["criteria"][C_WIDTH] = self.c_width()
         report["criteria"][C_SPACE] = self.c_space()
         report["criteria"][C_SWAP] = self.c_swap()
-        report["criteria"][C_STSEL] = self.c_stsel()
+        # stage C: #4 on the buttons only, #5 interim, #7 without surface
+        report["criteria"][C_STSEL] = self.c_stsel(with_text=False)
         report["criteria"][C_ORIENT] = self.c_orient()
         report["criteria"][C_KEPT] = self.c_kept()
-        report["criteria"][C_UNREQ] = self.c_unreq()
+        report["criteria"][C_UNREQ] = self.c_unreq(with_surface=False)
         report["criteria"][C_REBUILD] = self.c_rebuild()
         report["hygiene"] = self.hygiene_report()
         fd = self.rebuild.get("forced_diagnostic")
@@ -1821,7 +2674,8 @@ main = PS3Harness.as_main()
 # --------------------------------------------------------------------------
 
 BASELINE_REQUIRED_KEYS = ("bodies", "seed", "plane_x_m", "xsection",
-                          "modelling", "rebuild")
+                          "modelling", "rebuild", "glyph_faces",
+                          "housing_maps")
 BASELINE = HB.Baseline(BASELINE_PATH, BASELINE_SCHEMA,
                        BASELINE_REQUIRED_KEYS)
 
@@ -1853,6 +2707,9 @@ def capture_baseline(path, out_path=None):
         "xsection": cap["xsection"],
         "small_face_counts": cap["small_face_counts"],
         "light_cluster": cap["light_cluster"],
+        "glyph_faces": cap["glyph_faces"],
+        "body_skew_x": cap["body_skew_x"],
+        "housing_maps": cap["housing_maps"],
         "interference": {k: cap["interference"][k] for k in
                          ("tested_pairs", "pairs", "total_volume_m3")},
         "rebuild": {
@@ -1993,8 +2850,12 @@ def _score_stored(path):
 
 def _capture_note(cap):
     xs = cap.get("xsection") or {}
+    hm = cap.get("housing_maps") or {}
+    nglyph = sum(len(v) for v in (cap.get("glyph_faces") or {}).values())
     return (f"{len(cap.get('bodies') or [])} bodies, "
-            f"{xs.get('n_rays', 0)} rays in {xs.get('seconds', 0)}s")
+            f"{xs.get('n_rays', 0)} rays in {xs.get('seconds', 0)}s, "
+            f"{nglyph} glyph faces, {hm.get('triangles', 0)} housing "
+            f"triangles in {cap.get('surfaces_seconds', 0)}s")
 
 
 SPEC = HC.Spec(
