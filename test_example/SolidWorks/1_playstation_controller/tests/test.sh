@@ -8,7 +8,8 @@
 # The harness is complete, not a placeholder. It grades continuously --
 # every criterion returns a subscore in [0,1] -- and no criterion is a
 # score-zeroing gate. Weights live in ALL_CRITERIA in the harness and
-# nowhere else; task.toml's max_score must equal their sum.
+# nowhere else; task.toml's max_score must equal their sum (10.0 in
+# harness 3.0.0; tests/task/harness/test_harness.py checks it).
 #
 # Run locally on Windows instead, from this task's directory:
 #   python tests/task/harness/harness.py <path-to-candidate.SLDPRT>
@@ -18,7 +19,7 @@
 #   python tests/task/harness/harness.py --batch
 #
 # It prints a JSON score envelope to stdout (see common/harness_base.py's
-# finalize()): {"score": ..., "max_score": 7.0, "passed": ...,
+# finalize()): {"score": ..., "max_score": 10.0, "passed": ...,
 # "subscores": {...}}. The readable breakdown goes to stderr, so
 # redirecting stdout leaves the envelope alone.
 set -euo pipefail

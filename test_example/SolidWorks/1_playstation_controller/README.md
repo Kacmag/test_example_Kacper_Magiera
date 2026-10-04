@@ -1,88 +1,113 @@
-# Harness — continuous-scoring harness for the PS3 controller task
+# Harness — PS3 controller: widen 15 mm + left-handed layout
+
+`tests/task/harness/harness.py`, version **3.0.0**. It grades a candidate
+`.SLDPRT` against the seed part, frozen as measurements in
+`tests/task/prompt/input.json`, and prints one JSON score envelope out of
+**10.0**. What changed from 2.3.1, and why, is in [CHANGES.md](CHANGES.md).
+
+**Geometry only.** The harness reads mass properties, exact extreme points,
+ray sections, tessellated faces and height maps. It never reads feature
+names, body names, body order (`GetBodies2` "may vary the order") or the
+tree's structure. Every body's role is worked out from its shape and its
+place in the part. A candidate that solves the task another valid way
+scores the same as the reference: a different origin, a different body
+order, rebuilt buttons, or START/SELECT moved anywhere between the exact
+mirror and the mirror carried outboard with the stance.
+
+## What is graded
+
+Each criterion returns a continuous subscore in [0, 1]. None of them is a
+gate, so a broken tree no longer zeroes the geometry. Weights live in
+`ALL_CRITERIA`, each next to the clause of `instruction.md` it comes from.
+`task.toml`'s `max_score` is their sum, and a unit test keeps the two equal.
+
+| # | Criterion | Weight | Measurement |
+|---|---|---:|---|
+| 1 | widened 15 mm at the grips | 2.0 | Growth of the grip-lobe separation (+X rays through the housing where the seed's section is two grips) and of the body's X extent, both against +15 mm. Multiplied by a not-scaled check: the grip lobes must keep their width. |
+| 2 | clusters re-spaced to the stance | 2.0 | Each button cluster's x against its mirrored seed position carried outboard by the candidate's own half-widening h. Multiplied by cluster rigidity, by sticks/triggers/bumpers following the stance, and by fit (no new interference). |
+| 3 | d-pad and face buttons swapped | 2.0 | Which side of the candidate's own mirror plane each cluster sits on, ramped over one seed cluster radius. |
+| 4 | START/SELECT mirrored | 1.0 | START and SELECT buttons and their text, each anywhere between the exact mirror of its seed position and that mirror carried outboard by h. |
+| 5 | text and logos oriented | 1.0 | Each seed label (START, SELECT, L, R) is registered against the candidate's engraving faces as moved, mirrored or upside down. Also read: the side and reading of the □ symbol, and which way the START pointer points. The weakest item decides. |
+| 6 | text and logos preserved | 1.0 | The share of each seed label's and symbol's engraved area found again on the candidate. The weakest item decides. |
+| 7 | no unrequested changes | 0.5 | Bodies the edit leaves alone keep their shape and y/z; the housing keeps its Y/Z spans and, outside the edit zones, its top surface (height map against the seed's, warped by h). |
+| 8 | rebuilds cleanly | 0.5 | New failing features, sketches in an error state and new warnings after `EditRebuild3`, counted, never matched by name. |
+
+The asked-for edits (1–4) carry 7.0 and the two constraints the instruction
+names (5–6) carry 2.0. The implicit constraints (7–8) carry 1.0. An
+untouched seed collects 5–8 and nothing else, so it scores **3.0 / 10**.
+
+Frame: `u = x − P`, where P is the candidate's **own** mirror plane, the
+midline of its two grip lobes. h is half the candidate's **own**
+grip-separation growth. Re-spacing is judged against the stance the
+candidate actually built, so a wrongly sized widening is charged once, by
+criterion 1.
+
+Corpus, as graded by 3.0.0:
+
+| model | width | space | swap | st/sel | orient | logos | unreq | rebld | score |
+|---|---|---|---|---|---|---|---|---|---|
+| solution | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | **10.000** |
+| input (untouched seed) | 0.00 | 0.00 | 0.00 | 0.00 | 1.00 | 1.00 | 1.00 | 1.00 | 3.000 |
+| adversarial_feature_tree_with_errors | 0.00 | 0.16 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 4.823 |
+| adversarial_missing_glyphs | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 | 9.000 |
+| adversarial_only_one_button_cluster_mirrored | 1.00 | 0.50 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 8.000 |
+| adversarial_text_mirrored_incorrectly | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 | 1.00 | 9.000 |
+| adversarial_unrequested_change_elsewhere | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 9.500 |
+| adversarial_unwidened_shell_with_correct_clusters | 0.02 | 0.12 | 0.50 | 0.85 | 1.00 | 0.00 | 0.00 | 0.00 | 3.148 |
+| adversarial_widened_15mm_clusters_at_original_spacing | 1.00 | 0.00 | 0.00 | 0.00 | 1.00 | 1.00 | 1.00 | 1.00 | 5.000 |
+| adversarial_widened_by_30mm | 0.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 8.000 |
 
 ## Running
 
-Every command below is run from `task 1`, with SolidWorks **already open**
-and your work **saved** — each run closes the session's open documents before
-opening the next candidate.
+Every command is run from this task's directory, with SolidWorks **already
+open** and your work **saved**. Each run closes the session's open
+documents before it opens the next part. Use a Python with pywin32, numpy
+and scipy (the repository's `.venv` has them).
 
-The script is `tests\task\harness\harness.py`. Handing Python the directory
-instead of the file gets you `can't find '__main__' module in
-'...\tests\task\harness'`; that is a missing filename, not a broken harness.
+The script is `tests\task\harness\harness.py`. If you hand Python the
+directory instead of the file, you get `can't find '__main__' module`. That
+means the filename is missing, not that the harness is broken.
 
-### The usual run, in order
+### The usual run
 
-Say you have a reference part and a folder of candidates.
-
-**0. Check the yardstick is the right one.** Nothing here is graded in
-absolute terms — every criterion is a delta against the seed part, frozen as
-measurements in `tests/task/prompt/input.json`. If the candidates were edited
-from the seed that baseline was taken from, leave it alone. If they started
-from a different part, re-freeze first — and keep a copy of the current
-`input.json`, because the command overwrites it:
+**1. Prove the connection with one part.**
 
 ```bat
-python tests\task\harness\harness.py --capture-baseline path\to\seed.SLDPRT
+python tests\task\harness\harness.py solution\solution.SLDPRT
 ```
 
-**1. Prove the connection with one part.** Do not open with the whole corpus:
-it is 16–29 s per part, and if COM did not attach you want to know now.
+This must come back `10.0/10.0` with `passed: true`. **If the reference is
+not 10.000, stop.** The baseline or the machine is wrong, not the reference.
+
+**2. Measure the corpus.** Measuring needs SolidWorks and takes about two
+minutes per edited part (25 s for the seed). It only has to happen once:
 
 ```bat
-python tests\task\harness\harness.py reference.SLDPRT
+python tests\task\harness\harness.py --batch --capture-only
 ```
 
-This must come back `7.0/7.0`, `passed: true`. **If the reference is not
-7.000, stop** — the baseline or a threshold is wrong, not the reference. It is
-the one check worth doing every time.
+With no path, it takes the shipped task directory: the seed, the reference
+and the eight examples listed in `task.toml`. Captures land in
+`results\captures\`.
 
-**2. Measure the corpus.** Measuring, not scoring: this is the expensive half
-and it only has to happen once.
-
-```bat
-python tests\task\harness\harness.py --batch reference.SLDPRT examples --capture-only
-```
-
-`examples` is globbed for `*.SLDPRT` recursively and each file is labelled by
-its stem. Captures land in `results\captures\`, and the command prints the
-line that scores them.
-
-**3. Score.** Milliseconds, and no SolidWorks involved at all:
+**3. Score.** This needs no SolidWorks and takes a few seconds:
 
 ```bat
 python tests\task\harness\harness.py --batch --score-from results\captures
 ```
 
-You get a table on stdout, `results\summary.md` and `.csv`, and per model
-`results\<model>.envelope.json` (the score envelope), `.log` (the readable
-breakdown with per-criterion reasons) and `results\full\<model>.report.json`
-(every measurement taken).
+You get:
+- a table on stdout;
+- `results\summary.md` and `.csv`;
+- per model, `results\<model>.envelope.json` (the envelope) and `.log` (the readable breakdown);
+- per model, `results\full\<model>.report.json` (every measurement and every criterion's detail).
 
-A `.log` reading `UNGRADABLE` means the part was **not measured** — it would
-not open, has no bodies, or has no determinable symmetry plane. That is not
-the same verdict as "measured and wrong", and the reason is printed with it.
+`UNGRADABLE` in a `.log` means the part was **not measured**: it would not
+open, has no solid bodies, or has no housing. That is a different verdict
+from "measured and wrong", and the reason is printed with it.
 
-Useful additions:
-
-```bat
-... --batch DIR --only solution     REM filter labels by substring
-... --batch DIR --timeout 1800      REM raise the 900 s per-part cap
-... --batch DIR --out somewhere     REM default is results\
-python tests\task\harness\harness.py --help
-```
-
-### Why steps 2 and 3 are separate
-
-`--batch reference.SLDPRT examples` with no flags measures and scores in one
-pass, and that is fine for a one-off. But then every threshold or formula
-change costs another trip through SolidWorks.
-
-Measuring needs SolidWorks and takes 15–30 s per part. Scoring is arithmetic
-over two dictionaries. Split them and you measure once and re-score as often
-as you like — which also turns the stored captures into a regression suite
-that needs no CAD: change the harness, re-run step 3, see immediately which
-models moved.
-
+Splitting steps 2 and 3 makes the stored captures a regression suite that
+needs no CAD. Change a formula, re-run step 3, and see which models moved.
 The same split works for a single part:
 
 ```bat
@@ -90,196 +115,117 @@ python tests\task\harness\harness.py --capture-only part.SLDPRT -o cap.json
 python tests\task\harness\harness.py --score-from cap.json
 ```
 
-A capture carries its schema version, so `--score-from` warns rather than
-silently scoring against fields that are not there. A measurement a stored
-capture predates is reported UNVERIFIABLE and drops out of its weighted mean —
-scores stay comparable, they just rest on less evidence. To pick up a new
-measurement, re-freeze the baseline and re-capture.
+Other options: `--only substr,substr`, `--timeout SECONDS` (the default per
+part is 900 s), `--out DIR`, and `--help`. `--batch` also accepts explicit
+parts or any directory; a directory not laid out like the task is globbed
+for `*.SLDPRT`. Each part is measured in its own child process, so one
+wedged COM call can be timed out without ending the batch.
 
-### Grading a single part
+### One part, and the envelope
 
 ```bat
 python tests\task\harness\harness.py path\to\candidate.SLDPRT
 ```
 
-With no argument it grades whatever document is currently active. It prints a
-human-readable summary to **stderr** and exactly one JSON envelope to
-**stdout** — that envelope is the contract the evaluation pipeline reads, and
-batch mode never touches its shape:
+With no argument, it grades the active document. The readable summary goes
+to **stderr**. Exactly one JSON envelope goes to **stdout**; this is the
+contract the pipeline reads:
 
 ```json
 {
  "task_id": "solidworks-0001-playstation-controller",
- "score": 7.0,
- "max_score": 7.0,
+ "score": 10.0,
+ "max_score": 10.0,
  "passed": true,
  "subscores": {
-  "rebuild health": 1.0,
-  "modelling hygiene": 1.0,
-  "widened by 15 mm": 1.0,
-  "clusters at mirrored positions": 1.0,
-  "no new control interference": 1.0,
-  "left-handed layout achieved": 1.0,
-  "no unrequested changes": 1.0
+  "widened 15 mm at the grips": 1.0,
+  "clusters re-spaced to the stance": 1.0,
+  "d-pad and face buttons swapped": 1.0,
+  "START/SELECT mirrored": 1.0,
+  "text and logos oriented": 1.0,
+  "text and logos preserved": 1.0,
+  "no unrequested changes": 1.0,
+  "rebuilds cleanly": 1.0
  },
- "harness_version": "2.1.5"
+ "harness_version": "3.0.0"
 }
 ```
 
-#### What the weights mean
+`passed` means flawless, not "good enough": `finalize()` sets it to "every
+subscore is 1.0". `score` says how much of the task was done; `passed` says
+whether the answer is fully correct. Set `HARNESS_REPORT_JSON` to a path to
+keep the full report of a single run (batch mode does this for you).
 
-`max_score` is 7.0, and the seven components are not equal, because the
-instruction is not a list of equals. Weights live in `ALL_CRITERIA` in the
-harness, each with its reasoning next to it; `task.toml` carries their sum.
+### How the part is measured
 
-| | Weight | |
-|---|---:|---|
-| widened by 15 mm | 1.5 | what the task **asks for** — 5.0 of 7.0 |
-| clusters at mirrored positions | 1.5 | |
-| left-handed layout achieved | 2.0 | heaviest: the demand the last sentence is about |
-| no new control interference | 0.5 | what merely **constrains** the edit — 1.0 of 7.0 |
-| no unrequested changes | 0.5 | |
-| rebuild health | 0.5 | preserving design intent and the feature tree — 1.0 of 7.0 |
-| modelling hygiene | 0.5 | |
-
-The split matters because the bottom four are **negative** criteria: a
-candidate who never opened the file passes all of them. Their combined weight
-is therefore the floor a do-nothing submission collects — 28.6% here, against
-the 50% it collected when all five geometry components were equal.
-
-#### `passed` means flawless, not "good enough"
-
-`finalize()` sets `passed` to `all(subscore >= 1.0)` — every criterion
-perfect, not a pass mark. A candidate at 80% comes back `passed: false`, and
-that is the intended reading: **`score` says how much of the task was done,
-`passed` says whether the answer is fully correct.** In this corpus only two
-parts pass, the reference and its byte-identical copy, which doubles as the
-determinism check.
-
-Turning `passed` into a threshold would put the binary verdict back that the
-continuous scoring exists to remove, just at a different cut point — and the
-cut point would have to be invented, since nothing in the data suggests one.
-Where a pipeline needs an accept/reject decision, it belongs to whoever
-consumes the envelope and is taken from `score / max_score`.
-
-To keep every measurement rather than just the scores from a single run, set
-`HARNESS_REPORT_JSON` to an output path (batch mode does this for you):
-
-```bat
-set HARNESS_REPORT_JSON=out\solution.report.json
-python tests\task\harness\harness.py ..\SolidWorks\1_playstation_controller\solution\solution.SLDPRT
-```
-
-### What `--batch` accepts
-
-A list of parts, a directory, or both:
-
-```bat
-python tests\task\harness\harness.py --batch ..\SolidWorks\1_playstation_controller
-python tests\task\harness\harness.py --batch a.SLDPRT b.SLDPRT c.SLDPRT
-python tests\task\harness\harness.py --batch
-```
-
-With no argument at all it takes the shipped task directory.
-
-A directory laid out like the shipped task (`solution/`, `examples/`,
-`environment/`) is expanded with the usual labels, so the reference, the
-adversarials and the untouched seed keep the names the results are indexed by.
-Any other directory is globbed recursively and each part is labelled by its
-file stem.
-
-Each part is graded in its own child process, so one wedged COM call can be
-timed out without ending the batch.
+The saved part is brought up to date with `EditRebuild3` and measured as
+saved. A forced full rebuild runs **last**, as an unscored diagnostic.
+`ForceRebuild3` is not idempotent on these files: the reference settles with
+two failing DeleteFace features, and the seed's first forced pass after
+opening fails 18 features.
 
 ### Re-freeze the baseline
 
-`tests/task/prompt/input.json` is the seed part frozen as measurements —
-bodies, roles, the mirror plane, the interference budget, the modelling census
-and the seed's own feature errors. It is the yardstick every criterion is
-measured against, so it has to describe the part candidates actually started
-from, measured the way this harness measures.
+```bat
+python tests\task\harness\harness.py --capture-baseline environment\input.SLDPRT
+```
+
+This re-measures the seed and rewrites `input.json` (schema
+`ps-annotation-baseline/6`). The baseline holds:
+- the bodies and their structural roles, the mirror plane (x = 80.5 mm), the grip-lobe rays and the cluster geometry;
+- every engraving face, the housing height maps and the body skews;
+- the seed's own rebuild census.
+
+The thresholds the grader derives from it are recomputed from these at
+scoring time, among them the noise floor of the housing maps. Re-run the
+re-freeze only when the seed changes or the harness records something new,
+then re-capture the corpus. Re-measuring the same seed reproduces the
+baseline exactly once body ids are mapped by position (verified for 3.0.0).
+
+`--capture-seed-rebuild environment\input.SLDPRT` refreshes only the seed's
+rebuild census. That census describes the machine as much as the part, so
+run it on the grading machine. On this seed it is empty (199 features, no
+errors, no warnings).
+
+### Offline tests
 
 ```bat
-python tests\task\harness\harness.py --capture-baseline ..\SolidWorks\1_playstation_controller\environment\input.SLDPRT
+python -m unittest discover -s tests\task\harness -v
 ```
 
-Re-measures the seed and rewrites the whole baseline. Run it when the seed
-part changes, when the harness starts recording something it did not record
-before, or when porting the rubric to another part. Everything downstream
-shifts, so re-score the corpus afterwards and check the reference still lands
-on full marks.
+These need no SolidWorks. They run against stored captures of the ten
+shipped parts (`tests\task\harness\fixtures\*.json.gz`). They check that:
+- the reference scores full marks, the seed 3.0, and each example loses only the criteria listed for it;
+- valid variants of the reference keep full marks: shuffled body order, ids and names; origin moved in X, Y and Z; clusters within tolerance; START/SELECT anywhere in the mirrored band; rebuilt buttons;
+- defects injected into the reference cost their own criterion: reflected text, deleted symbols, a groove outside the edit zones, an X-scaled housing, sticks left at the old stance;
+- scoring is deterministic, including on a second live capture of the reference;
+- `task.toml` and this README agree with the code.
 
-```bat
-python tests\task\harness\harness.py --capture-seed-rebuild ..\SolidWorks\1_playstation_controller\environment\input.SLDPRT
-```
+## Not graded, and why
 
-Refreshes **only** the `rebuild` block — the per-feature error census of the
-untouched seed — and leaves every geometric measurement alone.
-
-That census is the one part of the baseline that describes the *machine* as
-much as the part. Mass properties and centroids are the same wherever you
-measure them; which features a SolidWorks build reports as errored or warning
-is not. `rebuild health` grades newly broken features *relative to* this
-census, precisely so a seed that already carries faults does not charge them
-to every candidate — but that only works if the census was taken where the
-grading happens. On this seed it is currently empty (199 features, no errors,
-no warnings), so any feature the grading machine flags counts against whoever
-is being graded.
-
-So: re-run this one on the machine that will do the grading, before a session,
-and if it comes back non-empty, the seed is reporting faults there that it did
-not report when it was frozen. Re-run `--capture-baseline` only when the
-geometry itself needs re-freezing — it is the heavier operation and moves
-every criterion at once.
-
-### Validate the scoring logic without SolidWorks
-
-```bash
-python3 tools/selftest_synthetic.py
-```
-
-Runs anywhere, including Linux and CI. `Grader` consumes two plain
-dictionaries and touches no COM object, so its arithmetic is testable in
-isolation. The script synthesises candidates by transforming the real baseline
-measurements to match each adversarial description, then asserts 13 properties
-(the reference scores full marks; a broken feature tree zeroes the geometry
-criteria while still emitting all seven subscores; every adversarial is
-distinct; doing nothing loses to every real attempt; destroying the evidence
-does not pay; and so on).
-
-This validates the **scoring logic**, not the measurement layer — `capture()`,
-`assign_roles()` and the port-light face matching all read live geometry.
-
----
-
-## Not machine-graded
-
-- **Whether the logos are correct rather than flipped.** The instruction
-  asks for exactly this, and it is **unverifiable by construction, not by
-  accident**: the PS triangle, circle, cross and square are left-right
-  symmetric split-faces, so a mirror of them is geometrically undetectable.
-  The harness records the reading as `UNVERIFIABLE` and gives it no weight
-  rather than scoring a proxy for it. Handedness is witnessed instead by
-  cluster sides, body inertia signs and the housing side signature.
-- **Whether standard parts are correct.** The second half of the same
-  sentence. Nothing in this grader reads a BOM, a configuration or a
-  library reference, and grading is name-blind by contract, so a
-  Toolbox screw mirrored into a left-hand thread reads the same as one
-  left alone.
-- **Whether engraved text is legible or correctly oriented.** What is read
-  is which SIDE of the symmetry plane engraving-scale faces sit on,
-  weighted by area. `adversarial_text_mirrored_incorrectly` is caught by
-  the port-light witness — that the indicator glyphs moved across the
-  plane — not by anything about the text itself.
-- **A shell widened without its controls moving.** The width criterion
-  measures the growth of mirror-pair separation, which is deliberately
-  robust to a housing remodel and for that reason blind to an edit that
-  widens the shell and leaves the bodies where they were. The X span is
-  captured and marked `diagnostic only -- not scored`. This is a limit of
-  the metric, not of the files.
-- **How much confidence the sidedness verdict deserves.** On genuinely
-  edited models the guard rests on ONE readable witness: the port-light
-  glyphs, because `housing_side_signature` returns `UNVERIFIABLE` whenever
-  the housing is remodelled. A part translated 57.5 mm still scores the
-  handedness criterion 1.000 with a note. Widening that evidence base is
-  the open item for the next revision.
+- **Symbols and parts that match their own mirror.** △ and ✕ read the same
+  mirrored, and so do the joystick caps (x-skew 0.000). A flipped copy of
+  them is the same geometry, so they are reported as achiral and not
+  scored for orientation. □ is read, for both side and reading. ○ is not
+  read at all: none of its engraving faces is below the 15 mm²
+  engraving-scale ceiling. The seed's 50 engraving-scale button faces all
+  belong to □, △ and ✕.
+- **The L1/L2 ↔ R1/R2 assignment swap.** The shoulder bodies are mirror
+  pairs of one shape, so swapping their assignment leaves no geometric
+  trace.
+- **Added hardware and remodelled internals.** The reference adds screws
+  and LED domes, shells the housing and rebuilds the buttons. These are
+  reported, not scored. The bottom, front and back height maps are
+  compared and reported; only the top view is scored, because the
+  reference itself changes the other three.
+- **Tree hygiene.** Suppressed features, the sketch-constraint mix and
+  external references are tree structure. They are reported, not scored.
+- **Reach and ergonomics.** Whether a thumb still reaches the clusters is
+  not a dimension. `task.toml` describes the adversarial that would settle
+  it.
+- **Engraving re-cut with a different face split.** Labels are matched face
+  by face (area within 2×, centroid within 0.3 mm). A label re-cut so that
+  its faces split differently would be under-counted by criterion 6. No
+  model in the corpus does this.
+- **A rotated part.** The frame is the seed's axes. A candidate that
+  re-orients the whole part (rather than moving it) is not re-aligned.

@@ -4,17 +4,19 @@ Task 1 (SolidWorks) -- PS3 controller: widen 15 mm + left-handed layout.
 
 Grades a candidate .SLDPRT against tests/task/prompt/input.json, the frozen
 measurements of the seed part. GEOMETRY ONLY: mass properties, exact extreme
-points, ray sections and face areas -- never feature or body names, and never
-body order (IPartDoc::GetBodies2 "may vary the order in which bodies are
-returned"). A candidate who solves the task a different valid way scores the
-same as the reference.
+points, ray sections, tessellated engraving faces and housing height maps --
+never feature or body names, and never body order (IPartDoc::GetBodies2 "may
+vary the order in which bodies are returned"). A candidate who solves the
+task a different valid way scores the same as the reference.
+What changed from 2.3.1 and why: CHANGES.md in the task directory.
 
 RUBRIC -- weights live in ALL_CRITERIA, each next to the clause it comes from
   1  widened 15 mm at the grips        2.0   grip-lobe separation growth and
                                              body X extent; x not-scaled check
-  2  clusters re-spaced to the stance  2.0   cluster x vs mirror + h; x rigidity,
-                                             followers (sticks/triggers/bumpers)
-                                             and fit (no new interference)
+  2  clusters re-spaced to the stance  2.0   cluster x vs mirror + h; times
+                                             rigidity, followers (sticks,
+                                             triggers, bumpers) and fit (no
+                                             new interference)
   3  d-pad and face buttons swapped    2.0   side of each cluster (continuous)
   4  START/SELECT mirrored             1.0   START/SELECT buttons and text at
                                              mirrored positions
@@ -65,6 +67,8 @@ CLI (harness.py --help for everything):
     python harness.py --batch [DIR|PARTS]     grade many, tabulate, write files
     python harness.py --capture-baseline P    re-freeze prompt/input.json
     python harness.py --capture-seed-rebuild  refresh only the rebuild census
+Offline tests (no SolidWorks), from the task directory:
+    python -m unittest discover -s tests/task/harness -v
 """
 
 from __future__ import annotations
@@ -114,16 +118,18 @@ BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "3.0.0-e"
-#: /6: engraving-scale faces of every body (area, tessellated centroid,
-#: normal), the housing's tessellated height maps and each body's X-skew,
-#: on top of /5 (exact extreme points, +X ray section of the housing, raw
-#: EditRebuild3 census, unscored forced-rebuild diagnostic).
-CAPTURE_SCHEMA = "ps3-capture/6"
-#: /5: the seed's glyph faces, height maps and skews, on top of /4 (the
-#: seed's structural roles, cluster geometry, grip-lobe rays and the
-#: thresholds derived from them -- see derive_seed).
-BASELINE_SCHEMA = "ps-annotation-baseline/5"
+HARNESS_VERSION = "3.0.0"
+#: /7: v2's small-face counts and "light cluster" dropped (criteria 5 and 6
+#: read the engraving faces instead). /6 added the engraving-scale faces of
+#: every body (area, tessellated centroid, normal), the housing's height
+#: maps and each body's X-skew; /5 exact extreme points, the +X ray section
+#: of the housing, the raw EditRebuild3 census and the unscored
+#: forced-rebuild diagnostic.
+CAPTURE_SCHEMA = "ps3-capture/7"
+#: /6: the same two v2 fields dropped. /5 added the seed's engraving faces,
+#: height maps and skews; /4 its structural roles, cluster geometry,
+#: grip-lobe rays and the thresholds derived from them (see derive_seed).
+BASELINE_SCHEMA = "ps-annotation-baseline/6"
 
 # Metres -> millimetres, applied once, where a number is reported or scored.
 MM = 1000.0
@@ -281,14 +287,6 @@ GLYPH_FACE_MAX_AREA = 15e-6
 #: about 1 mm wide, and any cut worth calling a feature is wider than that.
 MAP_STEP_M = 0.001
 
-# v2 carry-overs used by the interim criteria 5 and 6.
-SMALL_FACE_AREA = 15e-6          # engraving-scale faces (m2)
-LIGHT_FACE_MAX_AREA = 8e-6
-LIGHT_MIN_OFFPLANE_M = 0.040
-LIGHT_AREA_TOL_FRAC = 0.02
-LIGHT_CLUSTER_RADIUS_M = 0.020
-LIGHT_MIN_MATCHES = 3
-MARKINGS_FULL_FRACTION = 0.75
 NEUTRAL_UNVERIFIABLE = 0.5       # unreadable is not free
 
 CONTROL_ROLES = ("dpad", "face_buttons", "select", "start", "ps",
@@ -654,82 +652,6 @@ def housing_xsection(doc, hbodies, hext, keys=None):
             for i, k in enumerate(keys)}
     return {**grid, "rays": rays, "n_rays": len(keys),
             "seconds": round(time.time() - t0, 2)}
-
-
-def _small_face_counts(raw_bodies):
-    out = {}
-    for idx, b in enumerate(raw_bodies):
-        n = 0
-        for f in (z(b.GetFaces) or []):
-            try:
-                if float(z(f.GetArea)) < SMALL_FACE_AREA:
-                    n += 1
-            except Exception:                               # noqa: BLE001
-                continue
-        out[f"c{idx:02d}"] = n
-    return out
-
-
-def housing_faces(raw_bodies, housing):
-    """(area, box-centre xyz) per housing face."""
-    out = []
-    for hid in housing:
-        for f in (z(raw_bodies[int(hid[1:])].GetFaces) or []):
-            try:
-                a = float(z(f.GetArea))
-                box = z(f.GetBox)
-                c = [(float(box[k]) + float(box[k + 3])) / 2 for k in range(3)]
-            except Exception:                               # noqa: BLE001
-                continue
-            out.append((a, c))
-    return out
-
-
-def _light_group(cand, plane_x):
-    best = None
-    for a0, c0 in cand:
-        grp = [(a, c) for a, c in cand
-               if math.hypot(c[0] - c0[0], c[2] - c0[2])
-               < LIGHT_CLUSTER_RADIUS_M]
-        if best is None or len(grp) > len(best):
-            best = grp
-    if not best or len(best) < LIGHT_MIN_MATCHES:
-        return None
-    cx = sum(c[0] for _, c in best) / len(best)
-    return {"areas_m2": sorted(a for a, _ in best),
-            "centroid_m": [sum(c[k] for _, c in best) / len(best)
-                           for k in range(3)],
-            "side": 1 if cx >= plane_x else -1,
-            "n_faces": len(best)}
-
-
-def find_light_cluster_seed(faces, plane_x, bbox):
-    """v2 (interim criterion 5): the engraving-scale face cluster on the
-    top-rear edge well off the plane -- the engraved "R" shoulder label."""
-    y_top, z_rear = bbox[4], bbox[2]
-    cand = [(a, c) for a, c in faces
-            if a < LIGHT_FACE_MAX_AREA
-            and abs(c[0] - plane_x) > LIGHT_MIN_OFFPLANE_M
-            and (y_top - c[1]) < 0.030 and (c[2] - z_rear) < 0.020]
-    return _light_group(cand, plane_x) if len(cand) >= LIGHT_MIN_MATCHES \
-        else None
-
-
-def find_light_cluster_candidate(faces, plane_x, seed_cluster):
-    """v2: the seed cluster re-found by its mirror-invariant area multiset."""
-    if not seed_cluster:
-        return None
-    hits = []
-    for want in seed_cluster["areas_m2"]:
-        best, bd = None, None
-        for a, c in faces:
-            dd = abs(a - want) / max(want, 1e-30)
-            if dd < LIGHT_AREA_TOL_FRAC and (bd is None or dd < bd):
-                best, bd = (a, c), dd
-        if best:
-            hits.append(best)
-    return _light_group(hits, plane_x) if len(hits) >= LIGHT_MIN_MATCHES \
-        else None
 
 
 def control_interference(raw, bodies, controls, housing):
@@ -1105,7 +1027,8 @@ def _diamond(bs):
                            ((0, 3), (1, 2))):
         s1 = math.hypot(off[a][0] + off[b][0], off[a][1] + off[b][1]) / rm
         s2 = math.hypot(off[c][0] + off[d][0], off[c][1] + off[d][1]) / rm
-        cos = abs(off[a][0] * off[c][0] + off[a][1] * off[c][1]) / (r[a] * r[c])
+        cos = (abs(off[a][0] * off[c][0] + off[a][1] * off[c][1])
+               / (r[a] * r[c]))
         if s1 <= DIAMOND_TOL and s2 <= DIAMOND_TOL and cos <= DIAMOND_TOL:
             irr = max(spread, s1, s2, cos)
             if best is None or irr < best:
@@ -1813,14 +1736,6 @@ def capture(doc, baseline=None):
                 if xsec.get("rays") else (None, {})
             plane = plane if plane is not None else plane0
             roles, rdiag = seed_roles(bodies, plane, hext)
-    smf = _small_face_counts(raw)
-    lights = None
-    if hids and plane is not None:
-        hfaces = housing_faces(raw, hids)
-        lights = (find_light_cluster_candidate(hfaces, plane,
-                                               baseline.get("light_cluster"))
-                  if baseline else
-                  find_light_cluster_seed(hfaces, plane, gmin + gmax))
     controls = sorted({i for r in CONTROL_ROLES for i in roles.get(r, [])}
                       | {i for g in rdiag.get("duplicate_clusters", [])
                          for i in g})
@@ -1845,8 +1760,6 @@ def capture(doc, baseline=None):
         "capture_roles": roles,
         "capture_role_diag": rdiag,
         "widening_at_capture": wmeas,
-        "small_face_counts": smf,
-        "light_cluster": lights,
         "interference": intf,
         **surfaces,
     }
@@ -1886,8 +1799,9 @@ def rebuild_delta(rb, baseline):
 
 def translate_yz(measured, dy, dz):
     """A copy of a capture moved by (0, dy, dz): bodies, extents, glyph
-    faces and map origins. X needs no such step -- everything along X is
-    read relative to the part's own mirror plane."""
+    faces, map origins and the heights the maps store (top / bottom hold
+    absolute y, front / back absolute z). X needs no such step -- everything
+    along X is read relative to the part's own mirror plane."""
     import copy
     out = copy.deepcopy(measured)
     for b in out.get("bodies", []):
@@ -1906,6 +1820,10 @@ def translate_yz(measured, dy, dz):
     if hm:
         o = hm["origin_m"]
         hm["origin_m"] = [o[0], o[1] + dy, o[2] + dz]
+        for view, shp, kax in MAP_VIEWS:
+            if hm.get(view):
+                d = dy if kax == 2 else dz      # top/bottom: y; front/back: z
+                hm[view] = _enc(_dec(hm[view], hm[shp]) + d)
     return out
 
 
@@ -2180,7 +2098,8 @@ class Grader:
         if not (self.bl.get("glyph_faces") and self.ms.get("glyph_faces")):
             return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
                     "evidence": "no engraving faces in the baseline or the "
-                                "capture (re-capture with ps3-capture/6)"}
+                                "capture (captures before ps3-capture/6 "
+                                "lack them)"}
         sl, text, sym = self.label_results()
         items, skipped, det = {}, {}, {}
         # A reading wins clearly once it explains this much more of the label
@@ -2275,7 +2194,8 @@ class Grader:
         if not (self.bl.get("glyph_faces") and self.ms.get("glyph_faces")):
             return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
                     "evidence": "no engraving faces in the baseline or the "
-                                "capture (re-capture with ps3-capture/6)"}
+                                "capture (captures before ps3-capture/6 "
+                                "lack them)"}
         sl, text, sym = self.label_results()
         items = {}
         for name, r in text.items():
@@ -2340,8 +2260,9 @@ class Grader:
                 for i in controls:
                     e = extent_of(self.C[i])
                     if e:
-                        foot |= np.outer((xs >= e[0] - pad) & (xs <= e[3] + pad),
-                                         (zs >= e[2] - pad) & (zs <= e[5] + pad))
+                        foot |= np.outer(
+                            (xs >= e[0] - pad) & (xs <= e[3] + pad),
+                            (zs >= e[2] - pad) & (zs <= e[5] + pad))
                 dev = dev & ~foot
                 st["deviation_cells"] = int(dev.sum())
                 st["control_footprint_cells"] = int(foot.sum())
@@ -2694,8 +2615,6 @@ def capture_baseline(path, out_path=None):
         "bodies": cap["bodies"],
         "housing_ids": cap["housing_ids"],
         "xsection": cap["xsection"],
-        "small_face_counts": cap["small_face_counts"],
-        "light_cluster": cap["light_cluster"],
         "glyph_faces": cap["glyph_faces"],
         "body_skew_x": cap["body_skew_x"],
         "housing_maps": cap["housing_maps"],
