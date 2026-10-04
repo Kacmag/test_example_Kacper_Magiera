@@ -758,11 +758,34 @@
  },
  "rebuild": {
   "captured_from": "input.SLDPRT",
+  "mode": "incremental",
   "features": 199,
   "errors": 0,
   "warnings": 0,
   "feature_errors": {},
-  "note": "per-feature error census of the unmodified seed; the health gate grades candidates as a delta vs this"
+  "forced_diagnostic": {
+   "mode": "force-until-stable",
+   "scored": false,
+   "passes": [
+    {
+     "pass": 1,
+     "returned": true,
+     "error": null,
+     "seconds": 8.15,
+     "hard": 0,
+     "warnings": 0,
+     "failing": []
+    }
+   ],
+   "stable": true,
+   "seconds": 8.15,
+   "features": 199,
+   "census": {},
+   "bodies_before": 20,
+   "bodies_after": 20,
+   "max_body_volume_change_mm3": 2.2
+  },
+  "note": "per-feature error census of the unmodified seed after EditRebuild3; candidates are graded as a delta vs this (rebuild_delta). forced_diagnostic is unscored."
  },
  "measurement_notes": {
   "roles": "assigned geometrically; see assign_roles()",

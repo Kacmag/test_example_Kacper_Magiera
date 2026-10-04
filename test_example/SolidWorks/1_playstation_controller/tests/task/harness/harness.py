@@ -104,6 +104,7 @@ import json
 import math
 import os
 import sys
+import time
 from collections import Counter
 from itertools import permutations
 from pathlib import Path
@@ -149,13 +150,14 @@ BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "2.3.1"
+HARNESS_VERSION = "2.4.0"
 # Bumped whenever capture() changes what it records or what a field means.
-# /3 changed plane_x_m from "the baseline's plane" to "the plane this part
-# actually has". A /2 capture still scores correctly -- its plane equals the
-# baseline's, so the normalisation is a no-op -- but it cannot exercise the
-# translation handling, hence the warning rather than a refusal.
-CAPTURE_SCHEMA = "ps3-capture/4"
+# /4.1: the rebuild block is the RAW census taken after EditRebuild3, plus the
+# cached-vs-rebuilt body summary and an unscored forced-rebuild diagnostic;
+# the delta against the seed census is computed at scoring time
+# (rebuild_delta), so a capture no longer goes stale when the seed census is
+# refreshed.
+CAPTURE_SCHEMA = "ps3-capture/4.1"
 
 #: HOW FAR THE MEASURED MIRROR MAY SIT from where the seed's mirror
 #: travelled to, before it is called a mis-detection rather than an
@@ -943,9 +945,172 @@ def role_bboxes(bodies, roles):
     return out
 
 
+def _body_summary(bodies):
+    return sorted(({"volume_m3": b["volume_m3"], "area_m2": b["area_m2"],
+                    "centroid_m": b["centroid_m"]} for b in bodies),
+                  key=lambda r: -r["volume_m3"])
+
+
+def _census_key(census):
+    return sorted((n, int(c), bool(w)) for n, (c, w) in (census or {}).items())
+
+
+def incremental_census(doc):
+    """Bring the saved model up to date, then read each feature's error state.
+    THIS is the census rebuild health is scored on, and the geometry every
+    criterion reads is measured right after it.
+
+    IModelDoc2::EditRebuild3 rebuilds only what is out of date, so a file
+    whose cached B-rep is stale is regenerated where it is stale, and a
+    consistent file is left exactly as saved. Measured on SolidWorks 2026
+    SP4.1 (fresh open, seed / reference / feature_tree_with_errors /
+    unwidened_shell): it changed no body volume on any of them, and it
+    reports the saved trees' real faults (15 and 34 failing features on the
+    two broken adversaries, 0 on the seed and the reference).
+
+    A FORCED full rebuild is not used for scoring: on the same machine the
+    reference never rebuilds clean under it (DeleteFace33/34 fail on every
+    pass, two new warnings) although its saved state is consistent, and a
+    forced pass run straight after opening even broke the untouched seed
+    (18 features, -20 522 mm3). It is still taken, last, as an unscored
+    diagnostic (forced_rebuild_diagnostic).
+    """
+    try:
+        _, cached, _, _, _ = SC.capture_bodies(doc)
+    except Exception:                                       # noqa: BLE001
+        cached = []
+    t0 = time.time()
+    returned, error = None, None
+    try:
+        member = doc.EditRebuild3
+        returned = bool(member() if callable(member) else member)
+    except Exception as exc:                                # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+    seconds = time.time() - t0
+    census, meta = SC.feature_census(doc, rebuild=None)     # read only
+    return {"mode": "incremental",
+            "edit_rebuild_returned": returned,
+            "edit_rebuild_error": error,
+            "rebuild_seconds": round(seconds, 2),
+            "features": meta.get("features", 0),
+            "census": census or {},
+            "cached_bodies": _body_summary(cached)}
+
+
+#: Forced passes in the diagnostic, at most: repeated until two in a row give
+#: the same census. One pass is not a reading on this corpus -- the probe saw
+#: the reference go 4 -> 2 -> 2 failing features over three passes.
+FORCE_REBUILD_MAX_PASSES = 3
+
+
+def forced_rebuild_diagnostic(doc, max_passes=FORCE_REBUILD_MAX_PASSES):
+    """UNSCORED. How the tree fares when every feature is regenerated from
+    scratch, repeated until the census stops changing. Must run AFTER every
+    measurement: a forced rebuild mutates the geometry (the probe saw up to
+    3 264 mm3 move on feature_tree_with_errors).
+
+    IModelDoc2::ForceRebuild3 returns False when ANY feature fails, so its
+    return value is recorded per pass, never used as a verdict.
+    """
+    try:
+        _, before, _, _, _ = SC.capture_bodies(doc)
+    except Exception:                                       # noqa: BLE001
+        before = []
+    passes, census, meta = [], {}, {"features": 0}
+    previous, stable = None, False
+    for k in range(1, max_passes + 1):
+        t0 = time.time()
+        returned, error = None, None
+        try:
+            returned = bool(doc.ForceRebuild3(False))
+        except Exception as exc:                            # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+        seconds = time.time() - t0
+        census, meta = SC.feature_census(doc, rebuild=None)  # read only
+        census = census or {}
+        key = _census_key(census)
+        passes.append({"pass": k, "returned": returned, "error": error,
+                       "seconds": round(seconds, 2),
+                       "hard": sum(1 for _, _, w in key if not w),
+                       "warnings": sum(1 for _, _, w in key if w),
+                       "failing": [n for n, _, _ in key][:25]})
+        if (returned and not census) or key == previous:
+            stable = True
+            break
+        previous = key
+    try:
+        _, after, _, _, _ = SC.capture_bodies(doc)
+    except Exception:                                       # noqa: BLE001
+        after = []
+    a = sorted(b["volume_m3"] for b in before)
+    b = sorted(x["volume_m3"] for x in after)
+    return {"mode": "force-until-stable",
+            "scored": False,
+            "passes": passes,
+            "stable": stable,
+            "seconds": round(sum(p["seconds"] for p in passes), 2),
+            "features": meta.get("features", 0),
+            "census": census,
+            "bodies_before": len(a), "bodies_after": len(b),
+            "max_body_volume_change_mm3": (
+                round(max(abs(u - v) for u, v in zip(a, b)) * 1e9, 3)
+                if len(a) == len(b) and a else None)}
+
+
+def cache_drift(rebuild, bodies):
+    """How far the geometry cached in the file was from what its tree rebuilds
+    to. Diagnostic only -- never scored."""
+    cached = (rebuild or {}).get("cached_bodies")
+    if cached is None:
+        return None
+    a = sorted(r["volume_m3"] for r in cached)
+    b = sorted(x["volume_m3"] for x in bodies)
+    out = {"bodies_cached": len(a), "bodies_rebuilt": len(b),
+           "volume_cached_mm3": round(sum(a) * 1e9, 3),
+           "volume_rebuilt_mm3": round(sum(b) * 1e9, 3)}
+    if len(a) == len(b) and a:
+        out["max_body_volume_change_mm3"] = round(
+            max(abs(u - v) for u, v in zip(a, b)) * 1e9, 3)
+    return out
+
+
+def rebuild_delta(rb, baseline):
+    """The rebuild census as a delta against the seed's, computed at SCORING
+    time (v2.3.1 did it at capture time, so a refreshed seed census left every
+    stored capture stale). Same semantics as solidworks_capture.health_gate:
+    errors and warnings on features the seed census does not already flag.
+    A capture from before /4.1 already carries the delta and is returned as is.
+    """
+    rb = dict(rb or {})
+    if "census" not in rb:
+        return rb
+    census = rb.get("census") or {}
+    hard = {n: c for n, (c, w) in census.items() if not w}
+    warn = {n: c for n, (c, w) in census.items() if w}
+    seed = ((baseline or {}).get("rebuild") or {}).get("feature_errors") or {}
+    seed_hard = {n for n, v in seed.items() if not v[1]}
+    newly_broken = [{"name": n, "code": c} for n, c in sorted(hard.items())
+                    if n not in seed_hard]
+    new_warnings = [{"name": n, "code": c} for n, c in sorted(warn.items())
+                    if n not in seed]
+    rb.update({
+        "ok": not newly_broken,
+        "errors": len(newly_broken),
+        "warnings": len(warn),
+        "broken_features": newly_broken[:25],
+        "new_warnings": new_warnings[:25],
+        "pre_existing_errors": len(seed_hard),
+        "graded": "delta_vs_seed",
+        "note": (f"{len(newly_broken)} newly broken vs the seed's "
+                 f"{len(seed_hard)}; {len(new_warnings)} new warnings"),
+    })
+    return rb
+
+
 def capture(doc, baseline=None, plane_x=None):
-    rebuild = SC.health_gate(doc, baseline)
+    rebuild = incremental_census(doc)
     raw, bodies, boxes, gmin, gmax = SC.capture_bodies(doc)
+    rebuild["cache_drift"] = cache_drift(rebuild, bodies)
     smf = _small_face_counts(raw)
     roles = assign_roles(bodies, smf)
 
@@ -1020,12 +1185,16 @@ def capture(doc, baseline=None, plane_x=None):
         lights = None
 
     intf = control_interference(raw, bodies, roles)
+    title = str(z(doc.GetTitle))
+    modelling = SC.modelling_census(doc)
+    # LAST, because it mutates the geometry everything above has measured.
+    rebuild["forced_diagnostic"] = forced_rebuild_diagnostic(doc)
     return {
         "schema": CAPTURE_SCHEMA,
         "harness_version": HARNESS_VERSION,
-        "document": str(z(doc.GetTitle)),
+        "document": title,
         "rebuild": rebuild,
-        "modelling": SC.modelling_census(doc),
+        "modelling": modelling,
         "global": {"bbox_m": gmin + gmax,
                    "width_m": gmax[0] - gmin[0]},
         "plane_x_m": P,
@@ -1187,6 +1356,7 @@ class Grader:
         measured, self.plane_shift_m = normalise_plane_offset(baseline,
                                                               measured)
         self.ms = measured
+        self.rebuild = rebuild_delta(measured.get("rebuild"), baseline)
         self.P = baseline["plane_x_m"]
         self.B = {b["id"]: b for b in baseline["bodies"]}
         self.C = {c["id"]: c for c in measured["bodies"]}
@@ -1563,7 +1733,7 @@ class Grader:
         count, so the criterion transfers to tasks whose trees are a
         different size.
         """
-        rb = self.ms.get("rebuild", {})
+        rb = self.rebuild
         n_feat = rb.get("features") or 0
         broken = rb.get("errors")
         if broken is None:
@@ -1596,7 +1766,7 @@ class Grader:
         parts, detail = {}, {}
 
         # New rebuild warnings are available even without a modelling census.
-        rb = self.ms.get("rebuild", {})
+        rb = self.rebuild
         new_warn = len(rb.get("new_warnings", []) or [])
         parts["new_warnings"] = score_error(
             new_warn, TOL["warn_perfect"], TOL["warn_zero"])
@@ -2306,7 +2476,7 @@ class Grader:
     # -- assemble --------------------------------------------------------
     def grade(self):
         report = {"document": self.ms.get("document"),
-                  "rebuild": self.ms.get("rebuild", {}),
+                  "rebuild": self.rebuild,
                   "policy": POLICY,
                   "plane_x_m": self.P,
                   "plane_x_measured_m": self.ms.get("plane_x_measured_m"),
@@ -2342,31 +2512,32 @@ class Grader:
                 "along X; normalised to the baseline plane before comparing, "
                 "so the offset itself is not penalised")
 
-        # Health and hygiene are scored for EVERY candidate, including one
-        # whose tree does not rebuild.  Only the geometry criteria are gated:
-        # measurements taken from a broken rebuild are not trustworthy, but
-        # "how badly is it broken" is itself measurable and worth a score --
-        # otherwise every broken model collapses onto the same zero.
+        # NO REBUILD GATE. Geometry is measured after EditRebuild3
+        # (incremental_census), i.e. the saved model brought up to date; it
+        # is graded as delivered, and the tree's own faults are charged once,
+        # by rebuild health. A part whose rebuild leaves no solid bodies
+        # never reaches here (ungradable_reason).
         report["criteria"][C_HEALTH] = self.c0_health()
         report["criteria"][C_HYGIENE] = self.c0_hygiene()
 
-        rb = self.ms.get("rebuild", {})
-        if not rb.get("ok", False):
-            for k in names:
-                report["criteria"][k] = {
-                    "score": 0.0, "status": FAIL,
-                    "evidence": "not evaluated -- the feature tree does not "
-                                "rebuild clean, so geometry measurements are "
-                                "not trustworthy"}
-            report["overall_score"] = round(
-                sum(v["score"] for v in report["criteria"].values())
-                / len(report["criteria"]), 4)
-            report["overall"] = FAIL
+        rb = self.rebuild
+        if not rb.get("ok", True):
             report["notes"].append(
-                "Rebuild gate failed: the feature tree does not rebuild clean "
-                f"vs the seed census (errors={rb.get('errors')}). Geometry "
-                "criteria are zeroed; health and hygiene are still scored.")
-            return report
+                f"feature tree has {rb.get('errors')} newly broken feature(s) "
+                "after EditRebuild3; geometry is graded as rebuilt and the "
+                "fault is charged to rebuild health only")
+        if rb.get("cache_drift"):
+            report["cache_drift"] = rb["cache_drift"]
+        fd = rb.get("forced_diagnostic")
+        if fd:
+            report["forced_rebuild_diagnostic"] = fd
+            last = (fd.get("passes") or [{}])[-1]
+            report["notes"].append(
+                f"unscored diagnostic: under forced full rebuilds "
+                f"({len(fd.get('passes') or [])} pass(es), "
+                f"{'stable' if fd.get('stable') else 'NOT stable'}) "
+                f"{last.get('hard')} feature(s) fail and "
+                f"{last.get('warnings')} warn")
 
         ci = self.cluster_identity
         if ci and ci.get("verdict") != "measured":
@@ -2466,6 +2637,23 @@ def annotate_envelope(envelope, report):
 # stored captures doubles as a regression suite that needs no CAD at all.
 # --------------------------------------------------------------------------
 
+def open_fresh(app, path=None):
+    """The part at `path` loaded FROM DISK, or the active document.
+
+    solidworks_session.open_document reuses a document that is already open
+    under the same path. A rebuild is a mutation, so a document left open by
+    an earlier run (--capture-seed-rebuild never closed its document) is
+    measured in whatever state that run left it in -- observed: the seed
+    captured right after a census refresh had already been force-rebuilt
+    once and read differently from a fresh load. Sweeping the session first
+    makes every measurement start from the saved file. No path = the user's
+    active document, which is never closed.
+    """
+    if path:
+        SW.close_all_documents(app)
+    return SC.open_or_active(app, path)
+
+
 def measure_candidate(path=None, close_after=False, baseline=None):
     """Open a part and take every measurement. Returns the capture dict.
 
@@ -2477,7 +2665,7 @@ def measure_candidate(path=None, close_after=False, baseline=None):
     baseline = baseline if baseline is not None else load_baseline()
     app = SC.attach_app()
     try:
-        doc = SC.open_or_active(app, path)
+        doc = open_fresh(app, path)
     except Exception as exc:
         return {"schema": CAPTURE_SCHEMA, "harness_version": HARNESS_VERSION,
                 "document": Path(path).name if path else None,
@@ -2631,10 +2819,12 @@ def capture_baseline(path, out_path=None):
     """Re-freeze prompt/input.json from an unmodified seed part."""
     out_path = Path(out_path) if out_path else BASELINE_PATH
     app = SC.attach_app()
-    doc = SC.open_or_active(app, path)
+    doc = open_fresh(app, path)
 
-    census, meta = SC.feature_census(doc)
-    census = census or {}
+    # Same incremental rebuild as every candidate gets, so the census is a
+    # like-for-like reference for rebuild_delta().
+    inc = incremental_census(doc)
+    census, meta = inc["census"], {"features": inc["features"]}
     raw, bodies, boxes, gmin, gmax = SC.capture_bodies(doc)
     smf = _small_face_counts(raw)
     roles = assign_roles(bodies, smf)
@@ -2651,6 +2841,8 @@ def capture_baseline(path, out_path=None):
     hard = {n: c for n, (c, w) in census.items() if not w}
     warn = {n: c for n, (c, w) in census.items() if w}
     doc_title = str(z(doc.GetTitle))
+    modelling = SC.modelling_census(doc)
+    forced = forced_rebuild_diagnostic(doc)     # last: it mutates geometry
 
     baseline = {
         "schema": BASELINE_SCHEMA,
@@ -2662,7 +2854,7 @@ def capture_baseline(path, out_path=None):
         # seed counts. Omit them and c0 quietly falls back to rebuild warnings
         # alone, which is the one probe that needs no baseline -- a re-freeze
         # would then look successful while removing two thirds of the check.
-        "modelling": SC.modelling_census(doc),
+        "modelling": modelling,
         "global": {"bbox_m": gmin + gmax, "width_m": gmax[0] - gmin[0]},
         "roles": roles,
         "bodies": bodies,
@@ -2676,12 +2868,15 @@ def capture_baseline(path, out_path=None):
                          "total_volume_m3": intf["total_volume_m3"]},
         "rebuild": {
             "captured_from": doc_title,
+            "mode": "incremental",
             "features": meta.get("features", 0),
             "errors": len(hard),
             "warnings": len(warn),
             "feature_errors": census,
-            "note": "per-feature error census of the unmodified seed; the "
-                    "health gate grades candidates as a delta vs this",
+            "forced_diagnostic": forced,
+            "note": "per-feature error census of the unmodified seed after "
+                    "EditRebuild3; candidates are graded as a delta vs this "
+                    "(rebuild_delta). forced_diagnostic is unscored.",
         },
         "measurement_notes": {
             "roles": "assigned geometrically; see assign_roles()",
@@ -2694,6 +2889,8 @@ def capture_baseline(path, out_path=None):
     }
     BASELINE.freeze(baseline, out_path,
                     dump=lambda r: json.dumps(r, indent=1))
+    if path:            # leave nothing rebuilt behind for the next run
+        SW.close_all_documents(app)
     print(f"  "
           f"({len(bodies)} bodies, plane_x={plane * MM:.2f} mm, "
           f"{meta.get('features', 0)} features, {len(hard)} hard errors)",
@@ -2706,21 +2903,28 @@ def capture_seed_rebuild(path=None, out_path=None):
     out_path = Path(out_path) if out_path else BASELINE_PATH
     baseline = json.loads(out_path.read_text(encoding="utf-8"))
     app = SC.attach_app()
-    doc = SC.open_or_active(app, path)
-    census, meta = SC.feature_census(doc)
-    census = census or {}
+    doc = open_fresh(app, path)
+    inc = incremental_census(doc)
+    census, meta = inc["census"], {"features": inc["features"]}
     hard = {n: c for n, (c, w) in census.items() if not w}
     warn = {n: c for n, (c, w) in census.items() if w}
+    title = str(z(doc.GetTitle))
+    forced = forced_rebuild_diagnostic(doc)
     baseline["rebuild"] = {
-        "captured_from": str(z(doc.GetTitle)),
+        "captured_from": title,
+        "mode": "incremental",
         "features": meta.get("features", 0),
         "errors": len(hard),
         "warnings": len(warn),
         "feature_errors": census,
-        "note": "per-feature error census of the unmodified seed; the health "
-                "gate grades candidates as a delta vs this",
+        "forced_diagnostic": forced,
+        "note": "per-feature error census of the unmodified seed after "
+                "EditRebuild3; candidates are graded as a delta vs this "
+                "(rebuild_delta). forced_diagnostic is unscored.",
     }
     out_path.write_text(json.dumps(baseline, indent=1), encoding="utf-8")
+    if path:            # v2.3.1 left the rebuilt seed open, and the next
+        SW.close_all_documents(app)     # capture silently reused it
     print(f"refreshed rebuild census in {out_path} "
           f"({meta.get('features', 0)} features, {len(hard)} hard errors)",
           file=sys.stderr)
@@ -2756,19 +2960,19 @@ def _out_flag(argv, default=None):
 # the whole batch with it; a child can be timed out and the run continues.
 # --------------------------------------------------------------------------
 
-# Reference first, then the adversarials, then the loose ends.  Anything not
-# named here still runs -- it is appended in the order it was given.
+# Seed (the do-nothing control) and reference first, then the examples in the
+# order task.toml declares them. Anything not named here still runs.
 BATCH_ORDER = [
-    "solution",
-    "adversarial_widened_15mm_clusters_at_original_spacing",
-    "adversarial_unwidened_shell_with_correct_clusters",
-    "adversarial_widened_by_30mm",
-    "adversarial_text_mirrored_incorrectly",
-    "adversarial_only_one_button_cluster_mirrored",
-    "adversarial_feature_tree_with_errors",
-    "gpt5",
-    "examples_solution_copy",
     "input",
+    "solution",
+    "adversarial_feature_tree_with_errors",
+    "adversarial_missing_glyphs",
+    "adversarial_only_one_button_cluster_mirrored",
+    "adversarial_text_mirrored_incorrectly",
+    "adversarial_unrequested_change_elsewhere",
+    "adversarial_unwidened_shell_with_correct_clusters",
+    "adversarial_widened_15mm_clusters_at_original_spacing",
+    "adversarial_widened_by_30mm",
 ]
 
 SHORT = {C_HEALTH: "heal", C_HYGIENE: "hyg"}
@@ -2789,12 +2993,20 @@ def discover_models(task_dir):
         found["solution"] = ref
     ex = task_dir / "examples"
     if ex.is_dir():
-        for p in sorted(ex.glob("*.SLDPRT")):
-            # examples/solution.SLDPRT is byte-identical to the reference
-            # (same sha256 in task.toml). Kept as a determinism check, but
-            # labelled so it is not mistaken for an adversarial.
-            found["examples_solution_copy" if p.stem == "solution"
-                  else p.stem] = p
+        # One candidate per FOLDER: examples/<name>/<name>.SLDPRT. v2.3.1
+        # globbed examples/*.SLDPRT, which matches nothing in this layout,
+        # so `--batch` on the task directory silently graded only the
+        # reference and the seed. The corpus is what task.toml declares;
+        # an undeclared folder is parked, not graded.
+        declared = HB.declared_examples(task_dir / "task.toml")
+        for d in sorted(q for q in ex.iterdir() if q.is_dir()):
+            if declared is not None and d.name not in declared:
+                print(f"[skip] examples/{d.name} -- not declared in "
+                      f"task.toml [metadata.examples]", file=sys.stderr)
+                continue
+            p = HC.named_model(d, d.name, glob="*.SLDPRT")
+            if p is not None:
+                found[d.name] = p
     seed = task_dir / "environment" / "input.SLDPRT"
     if seed.is_file():
         found["input"] = seed        # the "did nothing" control
