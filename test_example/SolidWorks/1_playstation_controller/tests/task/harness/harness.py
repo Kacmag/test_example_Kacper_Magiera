@@ -16,17 +16,18 @@ RUBRIC -- weights live in ALL_CRITERIA, each next to the clause it comes from
                                              followers (sticks/triggers/bumpers)
                                              and fit (no new interference)
   3  d-pad and face buttons swapped    2.0   side of each cluster (continuous)
-  4  START/SELECT mirrored             1.0   START/SELECT at mirrored positions
-  5  text and logos oriented           1.0   INTERIM (stage B): v2's "R" label
-                                             side witness; stage D registers
-                                             every label
-  6  text and logos preserved          1.0   INTERIM (stage B): v2's face-button
-                                             engraving count
+  4  START/SELECT mirrored             1.0   START/SELECT buttons and text at
+                                             mirrored positions
+  5  text and logos oriented           1.0   every chiral label registered as
+                                             moved / mirrored / upside down;
+                                             symbol arrangement; START pointer
+  6  text and logos preserved          1.0   share of each seed label's
+                                             engraved area found again
   7  no unrequested changes            0.5   shape/position of the bodies the
                                              edit leaves alone, housing Y/Z
                                              spans; housing surface: stage E
-  8  rebuilds cleanly                  0.5   INTERIM (stage B): v2's newly
-                                             broken fraction
+  8  rebuilds cleanly                  0.5   new failing features, sketches in
+                                             an error state, new warnings
 
 FRAME
   u = x - P, with P the candidate's OWN mirror plane: the median midline of
@@ -112,7 +113,7 @@ BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "3.0.0-c"
+HARNESS_VERSION = "3.0.0-d"
 #: /6: engraving-scale faces of every body (area, tessellated centroid,
 #: normal), the housing's tessellated height maps and each body's X-skew,
 #: on top of /5 (exact extreme points, +X ray section of the housing, raw
@@ -2165,25 +2166,8 @@ class Grader:
                             "present) at the mirror of their seed positions; "
                             "carried outboard by up to h is also mirrored"}
 
-    # -- 5 (interim) -----------------------------------------------------
+    # -- 5 ---------------------------------------------------------------
     def c_orient(self):
-        seed_l = self.bl.get("light_cluster")
-        cand_l = self.ms.get("light_cluster")
-        if not seed_l or not cand_l:
-            return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
-                    "evidence": "INTERIM (stage B): the engraved 'R' label "
-                                "was not found, so its side cannot be read"}
-        same = seed_l["side"] == cand_l["side"]
-        s = 1.0 if same else 0.0
-        return {"score": s, "status": status_of(s),
-                "detail": {"seed_side": seed_l["side"],
-                           "candidate_side": cand_l["side"]},
-                "evidence": "INTERIM (stage B): v2's witness -- the engraved "
-                            "'R' shoulder label stays on its side; stage D "
-                            "replaces it with label registration"}
-
-    # -- 5 (stage D) -----------------------------------------------------
-    def c_orient_labels(self):
         """Every readable text label must read the seed's way round, the
         face-button symbols must keep their arrangement, and the START
         pointer must point the seed's way. The weakest item decides."""
@@ -2484,8 +2468,7 @@ class Grader:
         report["criteria"][C_WIDTH] = self.c_width()
         report["criteria"][C_SPACE] = self.c_space()
         report["criteria"][C_SWAP] = self.c_swap()
-        # stage C: #4 on the buttons only, #5 interim, #7 without surface
-        report["criteria"][C_STSEL] = self.c_stsel(with_text=False)
+        report["criteria"][C_STSEL] = self.c_stsel()
         report["criteria"][C_ORIENT] = self.c_orient()
         report["criteria"][C_KEPT] = self.c_kept()
         report["criteria"][C_UNREQ] = self.c_unreq(with_surface=False)
