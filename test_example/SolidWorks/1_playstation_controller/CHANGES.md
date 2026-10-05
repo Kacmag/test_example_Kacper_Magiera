@@ -1,4 +1,124 @@
-# CHANGES — PS3 controller harness 2.3.1 → 3.0.0
+# CHANGES — PS3 controller harness 2.3.1 → 3.0.0 → 3.1.0
+
+## 3.1.0 — red-team hardening
+
+A red-team pass attacked 3.0.0 offline. It built synthetic variants of
+the reference capture: valid solutions modelled differently, and wrong
+solutions. It never opened SolidWorks or touched the repository, and every
+number was reproduced by re-running its scripts.
+
+Each finding then got:
+- a test in `tests/task/harness/test_harness.py`, `RedTeam`, with its variants in `redteam_variants.py`;
+- a run showing the test fails on 3.0.0;
+- a fix;
+- a run showing it passes.
+
+Findings not fixed are pinned by expected-failure tests. Those tests document
+the limitation and will flag the day it is fixed.
+
+The criteria and weights are unchanged. What criteria 2, 3, 5, 6 and 7
+measure changed, and the capture records one new thing, hence 3.1.0.
+
+### Findings
+
+Totals are on the fresh 3.1.0 captures, scored by 3.0.0 (the commit
+`7c8039e`) and by 3.1.0.
+
+| ID | Finding | Type | 3.0.0 | 3.1.0 | Fix (justification) |
+|---|---|---|---:|---:|---|
+| RT01 | Clusters **copied, not moved**: the swapped clusters present, the originals left on their side (Mirror Body keeps its sources by default) | false pass | 10.000 | 8.000 | #3 averages the side score over every copy of a cluster. A d-pad-shaped cross is a d-pad (the seed has no other); a round cross counts as the face cluster only if it carries a face symbol. Duplicate clusters also count as controls in #2's fit: the capture's census already covers them. |
+| RT02 | A 15 × 15 × 1 mm pocket on a grip beside a cluster | false pass | 10.000 | 9.500 | #7's mask around swapped features is looked up outboard only, 0…h. A feature carried out by h warps exactly onto its mirrored seed position; one at the exact mirror sits up to h inboard. The old ±h sweep was twice as wide as that. With all masks together, a 1 mm change was visible on only 14.5 % of the reference's top surface; it is now 19 %. |
+| RT03 | A hole drilled through the housing, 6 / 12 mm | false pass | 10.000 | 9.709 / 9.500 | The silhouette band now grows from cells empty in **both** maps. Growing it from either map swallowed every hole only one map has, so the existing one-sided term could never fire. |
+| RT04 | A left-over copy of a stick (Move/Copy with "copy" ticked) | false pass + body-order dependence | 8.917 / 10.000 by order | 9.500 in every order | Kept bodies are congruent by fingerprint, then **assigned by position** (the seed's, carried out by h). A congruent body left over costs #7: new component `no_duplicate_parts`; the seed has one of each standard part. |
+| RT05 | Clusters at the right x but 4 mm too high (floating), or 6 mm off in z | false pass | 10.000 | 8.442 / 8.000 | #2's placement × `score_error(max(|dz|, |dtop|), 0.5, 5)`. Mirroring moves a cluster in x only, and these are the same tolerances as every other y/z drift. It reads the cluster's **top**, not its centroid: a rebuilt button moves its centroid (the reference's by 2.5–3 mm) but not its top (0.02 mm). |
+| RT06 | A stray 40 × 12 × 20 mm block standing on the housing | false pass | 10.000 | 9.500 | #7's top view counts cells where a body with no role rises above the housing's top surface. Decision 3 stands: hardware inside the shell is still not scored. The reference's screws and LED domes rise above nothing. |
+| RT07 | △ engraved upside down | false pass | 9.771 | 9.000 | #5 tests each item against the wrong readings its own engraving does **not** reproduce (△: not its mirror, but its 180° turn). The label normal is now the cut direction, read off the walls; the old PCA axis leaned 2.5° on shallow engravings and misplaced a turned symbol by more than 0.3 mm. |
+| RT16 | ○ deleted | false pass | 10.000 | 9.000 | **New measurement** (capture `/8`, baseline `/7`): the large planar faces of every non-housing body. Every symbol has a floor, an upward planar face at the engraving depth (seed: ○ 49.8, □ 44.2, △ 38.7, ✕ 32.4 mm²; the shared button faces are curved or face down). #6 reads ○ by its floor on the button in its place: area within 2×, offset from the button centre and depth below its top within 0.3 mm. |
+| RT08 | Housing left as three bodies, grip / centre / grip (cut at 37.5 / 47.5 / 61.5 mm) | false penalty | 9.000 / 0.000 / 3.500 | 10.000 | A housing body spans ≥ 35 % of the part in X **or Z**. Seed: the controls span at most 16.8 % of X and 26.4 % of Z (both a stick); a grip spans the full depth. No corpus capture changes housing set. |
+| RT09 | D-pad moulded in one piece | false penalty | 8.000 | 10.000 | With no four-arm cross, one body counts as the d-pad if: its plan is square (aspect ≤ 1.115); it is larger than any seed button; it is nearer the seed d-pad's plan size than the face cluster's; and it sits outside the centre region. Every bound is a seed measurement. |
+| RT10 | Labels re-cut with differently split faces: START/SELECT 50/50 or 30/70, all four labels 50/50 | false penalty | 8.551 / 8.239 / 8.167 | 10.000 | A face cut into two **coplanar** pieces keeps its total area and area-weighted centroid. A pair of coplanar candidate faces may stand for one seed face: as an anchor, to complete a partial match, or for an unmatched face. Same 0.3 mm and ±25 % tolerances; pieces must share one plane. |
+| RT11 | A 0.05 / 0.1 mm pip at the housing's lowest point | false penalty | 9.877 / 9.500 | 10.000 | Y/Z is aligned on one extreme point, so the pip offset the whole map. Each view now removes a uniform height offset first. The offset is the median over more compared cells than twice the zero area, so a scoring change can never be the majority it is read from. A real span change is still charged by `housing_yz_spans`. |
+
+### Limitations kept, each an expected-failure test
+
+| ID | Finding | 3.1.0 | Why it is not fixed |
+|---|---|---:|---|
+| RT12 | Buttons swapped, housing seats left unconverted (no clash) | 10.000 | A seat check would compare the housing around each cluster with the mirrored seed. The reference itself leaves 23 of its 291 deciding cells reading "unconverted". For comparison, the seed reads 0 of 527 converted, and the red team's swapped-seats variant about half. A full-credit threshold would be a number only the reference justifies. Buttons that collide with old seats are still charged by #2 fit. |
+| RT13 | A 30 × 20 × 2 mm pocket in the underside | 10.000 | Bottom, front and back are reported, not scored (decision 6). The reference itself makes symmetric 0.2–0.8 mm changes there: the grip tips, the front of the grips, 1,900 mm² of the back bridge. No seed-derived rule passes those and catches an equivalent groove. |
+| RT14 | START/SELECT re-typed 5 % larger | 9.055 | Matching is positional (0.3 mm), and the instruction gives no size tolerance to search over. Arguably a different engraving. |
+| RT15 | Symmetric symbols mirrored in place (e.g. the cluster mirrored, then □ and ○ swapped back) | 9.000 | Found while fixing RT07, and present in 3.0.0 too. □ is a symmetric shape, but its engraving's faces, walls included, are split asymmetrically (self-match under mirror 0.30). A mirrored □ therefore reads as flipped. Telling an invisible split from a visible flip needs the engraving's **shape** (its tessellation), a larger redesign of #5/#6. |
+| — | A part rotated as a whole | 9.5 at 0.05°, 9.47 at 0.5° (approximate synthesis) | The frame is the seed's axes, and the task never rotates the part. Fingerprints stay robust (2.4e-4 at 1°). |
+
+Checked and not an issue:
+- a single-body housing;
+- the reference without its screws and LED domes;
+- a 15 mm filler body left separate at the plane;
+- R/L labels placed on the other side;
+- sticks, triggers and bumpers mirrored (indistinguishable: seed x-skews ≤ 0.028).
+
+All of these score 10.0.
+
+### Effect on the corpus
+
+On fresh captures of all ten parts with 3.1.0 (`--batch --capture-only`,
+then `--score-from`):
+- the reference is **10.000** (`passed`), the seed **3.000**;
+- every example fails exactly the criteria it failed before.
+
+Two totals moved:
+- **only_one_button_cluster_mirrored, 8.000 → 7.500.** Its face buttons
+  were copied onto the d-pad's side and the originals left in place (the
+  render shows face buttons on both sides). #3 now counts that copy:
+  0.5 → 0.25.
+- **unwidened_shell_with_correct_clusters, 3.148 → 3.103.** Its displaced
+  d-pad stands 1.3 mm higher than the seed's. #2 now reads that: 0.125 →
+  0.103.
+
+feature_tree's round, symbol-less d-pad is not mistaken for a face-button
+copy: 4.823, unchanged.
+
+### Side effects to know
+
+- **Orientation margin.** Pair matching lets two coplanar pieces of L
+  stand for one of its faces under the mirror hypothesis. L's self-match
+  against its own mirror rises from 0.343 to 0.644, and the orientation
+  margin M, derived from those self-matches, from 0.1985 to 0.1778. L stays
+  testable (< 0.75), and text_mirrored still scores #5 = 0.
+- **The cut-direction normal.** It undoes most of the rise pair matching
+  caused in R's self-match under rotation: 0.186 in 3.0.0, 0.423 with pairs
+  alone, 0.202 in 3.1.0. The upside-down test is cleaner for every label
+  with walls; START and SELECT have none and keep the old axis.
+- **Bug found by the tests while adding the floor measurement.**
+  `translate_yz` did not move the new planar faces, so a part moved 5 mm in
+  Y read its ○ floor at the wrong depth. Fixed before release; the
+  origin-moved test pins it.
+- **The existing cluster-jitter valid variant.** It now moves clusters
+  0.4 mm in y and z instead of 1 mm, because y/z is scored with the 0.5 mm
+  band of every other y/z drift.
+- **Timing.**
+  - Scoring a part takes about 5 s instead of 3 s (pair matching).
+  - The test suite takes about 3.5 min.
+  - Capture time is unchanged, within noise.
+- **Re-captures.** The baseline was re-frozen (`/7`): every shared field is
+  identical to `/6` once body ids are mapped, and the 448 engraving faces
+  and the height maps are bit-identical. The ten parts and a second live
+  capture of the reference were re-captured with 3.1.0; the two reference
+  captures agree to round-off.
+
+### Files
+
+- `harness.py`;
+- `test_harness.py`;
+- `redteam_variants.py` (new);
+- the 11 fixtures (re-captured);
+- `tests/task/prompt/input.json` (re-frozen);
+- `README.md`, with a red-team section;
+- this file;
+- `task.toml` notes.
+
+---
+
+## 3.0.0 — the rewrite
 
 `tests/task/harness/harness.py` was rewritten in five stages on branch
 `harness-v3`. Each stage ended with a working harness, a commit, and a
@@ -11,7 +131,7 @@ table for the reference, the eight examples and the seed:
 | C | `cb61f71` | criteria 6 and 8; baseline re-frozen (`/5`) |
 | D | `84f8fc0` | criterion 5 by label registration |
 | E | `0cc8d14` | criterion 7 reads the housing surface |
-| final | this commit | v2 leftovers removed, a Y/Z frame bug fixed, baseline re-frozen (`/6`), offline tests, docs |
+| final | `7c8039e` | v2 leftovers removed, a Y/Z frame bug fixed, baseline re-frozen (`/6`), offline tests, docs |
 
 Every number below comes from a real run. The final table comes from
 `--batch --capture-only` with 3.0.0 on 5 Oct 2026, followed by

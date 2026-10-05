@@ -77,16 +77,20 @@ LOSES = {
     "adversarial_widened_by_30mm": {WIDTH},
 }
 
-#: The totals the corpus scored when 3.0.0 was released (regression guard).
+#: The totals the corpus scores (regression guard). Two moved in 3.1.0 on the
+#: same criteria they already failed: only_one 8.0 -> 7.5 (its face buttons
+#: were copied, the originals left in place: #3 counts the copy) and
+#: unwidened 3.148 -> 3.103 (its displaced d-pad stands 1.3 mm high: #2
+#: now reads a cluster's y/z).
 TOTALS = {
     "solution": 10.0,
     "input": 3.0,
     "adversarial_feature_tree_with_errors": 4.823,
     "adversarial_missing_glyphs": 9.0,
-    "adversarial_only_one_button_cluster_mirrored": 8.0,
+    "adversarial_only_one_button_cluster_mirrored": 7.5,
     "adversarial_text_mirrored_incorrectly": 9.0,
     "adversarial_unrequested_change_elsewhere": 9.5,
-    "adversarial_unwidened_shell_with_correct_clusters": 3.148,
+    "adversarial_unwidened_shell_with_correct_clusters": 3.103,
     "adversarial_widened_15mm_clusters_at_original_spacing": 5.0,
     "adversarial_widened_by_30mm": 8.0,
 }
@@ -137,8 +141,9 @@ def relabel(cap, seed=7):
         b["name"] = f"Body-Move/Copy{rng.randrange(10 ** 6)}"
     c["bodies"] = bodies
     c["housing_ids"] = sorted(new[i] for i in c["housing_ids"])
-    for key in ("glyph_faces", "body_skew_x"):
-        c[key] = {new[k]: v for k, v in c[key].items()}
+    for key in ("glyph_faces", "planar_faces", "body_skew_x"):
+        if key in c:
+            c[key] = {new[k]: v for k, v in c[key].items()}
     for p in (c.get("interference") or {}).get("pairs", []):
         p["a"], p["b"] = new[p["a"]], new[p["b"]]
     for key in ("capture_roles", "capture_role_diag", "widening_at_capture"):
@@ -155,11 +160,12 @@ def move(cap, d):
         for key in ("extent_m", "bbox_m"):
             if b.get(key):
                 b[key] = [v + d[k % 3] for k, v in enumerate(b[key])]
-    for rows in c["glyph_faces"].values():
-        for r in rows:
-            r[1] += dx
-            r[2] += dy
-            r[3] += dz
+    for key in ("glyph_faces", "planar_faces"):
+        for rows in (c.get(key) or {}).values():
+            for r in rows:
+                r[1] += dx
+                r[2] += dy
+                r[3] += dz
     xs = c["xsection"]
     xs["y0_m"] += dy
     xs["z0_m"] += dz
@@ -186,11 +192,12 @@ def move_bodies(c, ids, d):
             for key in ("extent_m", "bbox_m"):
                 if b.get(key):
                     b[key] = [v + d[k % 3] for k, v in enumerate(b[key])]
-    for i in ids:
-        for r in c["glyph_faces"].get(i, []):
-            r[1] += d[0]
-            r[2] += d[1]
-            r[3] += d[2]
+    for key in ("glyph_faces", "planar_faces"):
+        for i in ids:
+            for r in (c.get(key) or {}).get(i, []):
+                r[1] += d[0]
+                r[2] += d[1]
+                r[3] += d[2]
     return c
 
 
@@ -311,10 +318,13 @@ class ValidVariants(unittest.TestCase):
                 self.assertFullMarks(move(capture("solution"), d))
 
     def test_clusters_placed_within_tolerance(self):
+        # 0.4 mm in every axis: inside the 0.5 mm perfect band of x and,
+        # since 3.1.0 scores a cluster's y/z too, of y and z.
         c = capture("solution")
         g = grader(c)
-        move_bodies(c, set(g.roles["dpad"]), (0.0004, 0.001, -0.001))
-        move_bodies(c, set(g.roles["face_buttons"]), (-0.0004, -0.001, 0.001))
+        move_bodies(c, set(g.roles["dpad"]), (0.0004, 0.0004, -0.0004))
+        move_bodies(c, set(g.roles["face_buttons"]),
+                    (-0.0004, -0.0004, 0.0004))
         self.assertFullMarks(c)
 
     def test_start_select_anywhere_in_the_mirrored_band(self):
@@ -425,6 +435,130 @@ class Controls(unittest.TestCase):
         # two of the six followers left behind (triggers and bumpers moved)
         self.assertAlmostEqual(space["components"]["followers"], 4 / 6,
                                places=2)
+
+
+# -- the red-team pass on 3.0.0 --------------------------------------------
+
+sys.path.insert(0, str(HERE))
+import redteam_variants as RV                                     # noqa: E402
+
+TH = sys.modules[__name__]
+
+
+def below(cap):
+    return {k for k, v in scores(grade(cap)).items() if v < 1.0}
+
+
+class RedTeam(unittest.TestCase):
+    """The red-team findings on 3.0.0 (CHANGES.md, "Red team"). Every test
+    here failed on 3.0.0. The expected failures are the findings left as
+    documented limitations; each says why."""
+
+    # -- wrong solutions 3.0.0 let through -------------------------------
+    def test_rt01_clusters_copied_not_moved(self):
+        s = scores(grade(RV.clusters_copied(capture("solution"), TH)))
+        self.assertEqual({k for k, v in s.items() if v < 1.0}, {SPACE, SWAP},
+                         msg=str(s))
+        self.assertLessEqual(s[SWAP], 0.5)
+
+    def test_rt02_pocket_beside_a_cluster(self):
+        cap = RV.pocket(capture("solution"), TH, u_mm=105.5, z_mm=-25.6)
+        self.assertEqual(below(cap), {UNREQ})
+
+    def test_rt03_hole_through_the_housing(self):
+        for d in (6.0, 12.0):
+            with self.subTest(d_mm=d):
+                cap = RV.through_hole(capture("solution"), TH, d_mm=d)
+                self.assertEqual(below(cap), {UNREQ})
+
+    def test_rt04_leftover_stick_whatever_the_body_order(self):
+        base = capture("solution")
+        reports = [grade(RV.leftover_stick(base, TH, first=True)),
+                   grade(RV.leftover_stick(base, TH, first=False))]
+        reports += [grade(relabel(RV.leftover_stick(base, TH), seed))
+                    for seed in range(1, 7)]
+        totals = {r["weighted_score"] for r in reports}
+        self.assertEqual(len(totals), 1, msg=str(totals))
+        self.assertEqual({k for k, v in scores(reports[0]).items()
+                          if v < 1.0}, {UNREQ})
+
+    def test_rt05_clusters_off_in_y_or_z(self):
+        for dy, dz in ((4.0, 0.0), (0.0, 6.0)):
+            with self.subTest(dy_mm=dy, dz_mm=dz):
+                cap = RV.clusters_offset(capture("solution"), TH, dy, dz)
+                self.assertEqual(below(cap), {SPACE})
+
+    def test_rt06_stray_body_on_the_housing(self):
+        cap = RV.block_on_top(capture("solution"), TH)
+        self.assertEqual(below(cap), {UNREQ})
+
+    def test_rt07_symbol_upside_down(self):
+        cap = RV.symbol_upside_down(capture("solution"), TH, "symbol top")
+        self.assertEqual(below(cap), {ORIENT})
+
+    # -- valid solutions 3.0.0 penalised ---------------------------------
+    def assertFullMarks(self, cap):
+        s = scores(grade(cap))
+        self.assertEqual(s, {k: 1.0 for k in ALL}, msg=str(s))
+
+    def test_rt08_housing_in_three_pieces(self):
+        for cut in (37.5, 47.5, 61.5):
+            with self.subTest(cut_mm=cut):
+                self.assertFullMarks(RV.three_piece_housing(
+                    capture("solution"), TH, cut_mm=cut))
+
+    def test_rt09_dpad_moulded_in_one_piece(self):
+        self.assertFullMarks(RV.one_piece_dpad(capture("solution"), TH))
+
+    def test_rt10_labels_recut_with_split_faces(self):
+        for frac, names in ((0.5, ("START", "SELECT")),
+                            (0.3, ("START", "SELECT")),
+                            (0.5, ("START", "SELECT", "R", "L"))):
+            with self.subTest(frac=frac, names=names):
+                self.assertFullMarks(RV.labels_resplit(
+                    capture("solution"), TH, frac=frac, names=names))
+
+    def test_rt11_pip_at_the_lowest_point(self):
+        for d in (0.05, 0.1):
+            with self.subTest(delta_mm=d):
+                self.assertFullMarks(RV.lowest_point_pip(
+                    capture("solution"), TH, delta_mm=d))
+
+    # -- documented limitations ------------------------------------------
+    def test_rt16_circle_symbol_deleted(self):
+        cap = RV.circle_deleted(capture("solution"), TH)
+        self.assertEqual(below(cap), {KEPT})
+
+    @unittest.expectedFailure
+    def test_rt12_limit_seats_not_converted(self):
+        # The reference itself leaves 23 of its 291 deciding seat cells
+        # reading "unconverted"; a full-credit threshold would be tuned to
+        # it. Partly covered: buttons colliding with old seats cost #2 fit.
+        cap = RV.seats_not_converted(capture("solution"), TH)
+        self.assertLess(grade(cap)["weighted_score"], 10.0)
+
+    @unittest.expectedFailure
+    def test_rt13_limit_pocket_on_the_underside(self):
+        # Bottom/front/back are reported, not scored: the reference makes
+        # symmetric 0.2-0.8 mm changes there itself.
+        cap = RV.pocket_underneath(capture("solution"), TH)
+        self.assertIn(UNREQ, below(cap))
+
+    @unittest.expectedFailure
+    def test_rt14_limit_text_retyped_five_percent_larger(self):
+        # Matching is positional (0.3 mm); a re-typed label at another size
+        # is a different engraving. No instruction-based size tolerance.
+        self.assertFullMarks(RV.text_rescaled(capture("solution"), TH))
+
+    @unittest.expectedFailure
+    def test_rt15_limit_symmetric_symbols_mirrored_in_place(self):
+        # The square is a symmetric shape, but its engraving's faces (walls
+        # included: self-match 0.32) are split asymmetrically, so a square
+        # mirrored in place reads as flipped. Telling an invisible split
+        # from a visible flip needs the engraving's shape (tessellation),
+        # not its faces. Found during the red-team fixes; also in 3.0.0.
+        self.assertFullMarks(RV.symbols_mirrored_in_place(
+            capture("solution"), TH))
 
 
 # -- the documents agree with the code -------------------------------------

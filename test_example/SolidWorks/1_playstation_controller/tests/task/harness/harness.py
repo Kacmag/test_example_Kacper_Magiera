@@ -8,27 +8,33 @@ points, ray sections, tessellated engraving faces and housing height maps --
 never feature or body names, and never body order (IPartDoc::GetBodies2 "may
 vary the order in which bodies are returned"). A candidate who solves the
 task a different valid way scores the same as the reference.
-What changed from 2.3.1 and why: CHANGES.md in the task directory.
+What changed from 2.3.1 and why, including the 3.1.0 red-team pass:
+CHANGES.md in the task directory.
 
 RUBRIC -- weights live in ALL_CRITERIA, each next to the clause it comes from
   1  widened 15 mm at the grips        2.0   grip-lobe separation growth and
                                              body X extent; x not-scaled check
-  2  clusters re-spaced to the stance  2.0   cluster x vs mirror + h; times
+  2  clusters re-spaced to the stance  2.0   cluster x vs mirror + h, its z
+                                             and top height kept; times
                                              rigidity, followers (sticks,
                                              triggers, bumpers) and fit (no
                                              new interference)
-  3  d-pad and face buttons swapped    2.0   side of each cluster (continuous)
+  3  d-pad and face buttons swapped    2.0   side of each cluster (continuous),
+                                             a copy left behind counted
   4  START/SELECT mirrored             1.0   START/SELECT buttons and text at
                                              mirrored positions
-  5  text and logos oriented           1.0   every chiral label registered as
-                                             moved / mirrored / upside down;
+  5  text and logos oriented           1.0   every label registered as moved /
+                                             mirrored / upside down, against
+                                             the readings it can be told from;
                                              symbol arrangement; START pointer
   6  text and logos preserved          1.0   share of each seed label's
                                              engraved area found again
   7  no unrequested changes            0.5   shape/position of the bodies the
-                                             edit leaves alone, housing Y/Z
-                                             spans, housing top surface
-                                             outside the edit zones
+                                             edit leaves alone, no duplicates
+                                             of them, housing Y/Z spans,
+                                             housing top surface outside the
+                                             edit zones (holes and bodies
+                                             rising above it included)
   8  rebuilds cleanly                  0.5   new failing features, sketches in
                                              an error state, new warnings
 
@@ -43,15 +49,18 @@ FRAME
 
 IDENTITY (no names, no order)
   housing           every body spanning >= HOUSING_SPAN_FRAC of the part's X
-                    extent (the reference splits it into two shells)
+                    or Z extent (the reference splits it into two shells; a
+                    grip cut off as its own body spans the full depth)
   kept bodies       sticks, triggers, bumpers and the two small bodies on the
-                    plane: optimal assignment to the seed's bodies by shape
-                    fingerprint -- the edit has no reason to reshape them
+                    plane: congruent to the seed's by shape fingerprint, then
+                    assigned by position -- the edit has no reason to
+                    reshape them, and body order never decides
   button clusters   four congruent bodies forming a cross; the d-pad is the
                     one with elongated arms (plan aspect), the face buttons
                     are round. Structural, so a rebuilt or resized button set
                     is still recognised (the reference rebuilds both: face
-                    buttons -53 % volume, d-pad arms +66 %)
+                    buttons -53 % volume, d-pad arms +66 %); a d-pad moulded
+                    in one piece is recognised by its plan size
   START / SELECT    the off-plane bodies near the seed's centre buttons,
                     assigned by scale-invariant shape
 
@@ -118,18 +127,21 @@ BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "3.0.0"
-#: /7: v2's small-face counts and "light cluster" dropped (criteria 5 and 6
-#: read the engraving faces instead). /6 added the engraving-scale faces of
+HARNESS_VERSION = "3.1.0"
+#: /8: the large planar faces of every non-housing body (a face-button
+#: symbol's floor; the circle has no engraving-scale face at all). /7: v2's
+#: small-face counts and "light cluster" dropped (criteria 5 and 6 read the
+#: engraving faces instead). /6 added the engraving-scale faces of
 #: every body (area, tessellated centroid, normal), the housing's height
 #: maps and each body's X-skew; /5 exact extreme points, the +X ray section
 #: of the housing, the raw EditRebuild3 census and the unscored
 #: forced-rebuild diagnostic.
-CAPTURE_SCHEMA = "ps3-capture/7"
-#: /6: the same two v2 fields dropped. /5 added the seed's engraving faces,
+CAPTURE_SCHEMA = "ps3-capture/8"
+#: /7: the seed's large planar faces of non-housing bodies. /6: the same
+#: two v2 fields dropped. /5 added the seed's engraving faces,
 #: height maps and skews; /4 its structural roles, cluster geometry,
 #: grip-lobe rays and the thresholds derived from them (see derive_seed).
-BASELINE_SCHEMA = "ps-annotation-baseline/6"
+BASELINE_SCHEMA = "ps-annotation-baseline/7"
 
 # Metres -> millimetres, applied once, where a number is reported or scored.
 MM = 1000.0
@@ -236,9 +248,11 @@ TOL = {
 }
 
 # Structural constants, each with its basis.
-#: A housing body spans the controller. Seed: the housing spans 100 % of the
-#: part's X extent, the widest control (a trigger) 11 %. Split shells or
-#: halves keep each piece above a third.
+#: A housing body spans the controller across (X) or front to back (Z).
+#: Seed: the housing spans 100 % of the part's X extent and 98.5 % of its Z;
+#: the widest control spans 16.8 % of X and the deepest 26.4 % of Z (both
+#: a stick). Split shells or halves keep each piece above a third in X; a
+#: grip cut off as its own body still spans the full depth in Z.
 HOUSING_SPAN_FRAC = 0.35
 #: Bootstrap grouping for the SEED's own clusters only: its face buttons
 #: differ by 0.011 in fingerprint (different symbols), its two closest
@@ -740,22 +754,27 @@ def _face_normal(face):
         return None
 
 
-def body_faces(body, glyphs=True, tess=True):
-    """(glyph faces, triangles) of one body. A glyph face is [area, cx, cy,
-    cz, nx, ny, nz] (m2, m), centroid from the face's own tessellation (box
-    centre as fallback), normal zeros when the face is not planar."""
+def body_faces(body, glyphs=True, tess=True, planar=False):
+    """(glyph faces, triangles, large planar faces) of one body. A face row
+    is [area, cx, cy, cz, nx, ny, nz] (m2, m), centroid from the face's own
+    tessellation (box centre as fallback), normal zeros when the face is not
+    planar. Glyph faces are the engraving-scale ones (< GLYPH_FACE_MAX_AREA);
+    with planar=True the PLANAR faces at or above that size are returned
+    too (a symbol's floor: the circle's has no smaller face at all)."""
     import numpy as np
-    out, tris_all = [], []
+    out, big, tris_all = [], [], []
     for f in (z(body.GetFaces) or []):
         try:
             area = float(z(f.GetArea))
         except Exception:                                   # noqa: BLE001
             continue
         small = glyphs and area < GLYPH_FACE_MAX_AREA
-        tris = _face_tris(f) if (tess or small) else None
+        normal = _face_normal(f) if (small or planar) else None
+        large = planar and not small and normal is not None
+        tris = _face_tris(f) if (tess or small or large) else None
         if tess and tris is not None:
             tris_all.append(tris)
-        if small:
+        if small or large:
             c = _tri_area_centroid(tris)[0] if tris is not None else None
             if c is None:
                 try:
@@ -764,9 +783,10 @@ def body_faces(body, glyphs=True, tess=True):
                          for k in range(3)]
                 except Exception:                           # noqa: BLE001
                     continue
-            out.append([area] + [float(v) for v in c]
-                       + (_face_normal(f) or [0.0, 0.0, 0.0]))
-    return out, (np.concatenate(tris_all) if tris_all else None)
+            row = ([area] + [float(v) for v in c]
+                   + (normal or [0.0, 0.0, 0.0]))
+            (out if small else big).append(row)
+    return out, (np.concatenate(tris_all) if tris_all else None), big
 
 
 def surface_skew_x(tris):
@@ -871,28 +891,32 @@ def housing_maps(tris, hext, step=None):
 
 
 def capture_surfaces(raw, bodies, hids, hext):
-    """Glyph faces of every body, the housing's height maps and each
-    non-housing body's X-skew. Role-free on purpose: scoring decides which
-    bodies matter, so a role rule changed later still finds its data."""
+    """Glyph faces of every body, the large planar faces and X-skew of each
+    non-housing body, and the housing's height maps. Role-free on purpose:
+    scoring decides which bodies matter, so a role rule changed later still
+    finds its data."""
     import numpy as np
     t0 = time.time()
-    glyphs, skew, htris = {}, {}, []
+    glyphs, planar, skew, htris = {}, {}, {}, []
     for b, rb in zip(bodies, raw):
         is_h = b["id"] in hids
         try:
-            g, tris = body_faces(rb, glyphs=True, tess=True)
+            g, tris, big = body_faces(rb, glyphs=True, tess=True,
+                                      planar=not is_h)
         except Exception:                                   # noqa: BLE001
-            g, tris = [], None
+            g, tris, big = [], None, []
         glyphs[b["id"]] = g
         if is_h:
             if tris is not None:
                 htris.append(tris)
         else:
+            planar[b["id"]] = big
             skew[b["id"]] = surface_skew_x(tris)
     maps = None
     if htris and hext:
         maps = housing_maps(np.concatenate(htris), hext)
-    return {"glyph_faces": glyphs, "body_skew_x": skew, "housing_maps": maps,
+    return {"glyph_faces": glyphs, "planar_faces": planar,
+            "body_skew_x": skew, "housing_maps": maps,
             "surfaces_seconds": round(time.time() - t0, 2)}
 
 
@@ -905,13 +929,13 @@ def housing_ids(bodies):
     ext = {k: e for k, e in ext.items() if e}
     if not ext:
         return []
-    x0 = min(e[0] for e in ext.values())
-    x1 = max(e[3] for e in ext.values())
-    w = x1 - x0
+    w = max(e[3] for e in ext.values()) - min(e[0] for e in ext.values())
+    d = max(e[5] for e in ext.values()) - min(e[2] for e in ext.values())
     if w <= 0:
         return []
     return sorted(k for k, e in ext.items()
-                  if (e[3] - e[0]) >= HOUSING_SPAN_FRAC * w)
+                  if (e[3] - e[0]) >= HOUSING_SPAN_FRAC * w
+                  or (d > 0 and (e[5] - e[2]) >= HOUSING_SPAN_FRAC * d))
 
 
 def union_extent(bodies, ids):
@@ -1281,13 +1305,25 @@ HYPOTHESES = ("T", "R", "Rot")
 
 
 def label_frame(F):
-    """Area-weighted centroid and unit normal of a label: the normal is the
-    smallest-variance axis of the face centroids, turned to the +Y side."""
+    """Area-weighted centroid and unit normal of a label, turned to the +Y
+    side. The normal is the engraving's CUT direction when its planar walls
+    fix one: every wall of a cut is parallel to it, so it is the axis the
+    wall normals leave empty (needs walls facing two ways). Otherwise the
+    smallest-variance axis of the face centroids -- which leans on a shallow
+    engraving (the seed's triangle: 2.5 deg), enough to misplace a symbol
+    turned upside down about its real axis by more than GLYPH_POS_TOL_M."""
     import numpy as np
-    a, P = F[:, 0], F[:, 1:4]
+    a, P, N = F[:, 0], F[:, 1:4], F[:, 4:7]
     c = (P * a[:, None]).sum(0) / a.sum()
-    X = (P - c) * np.sqrt(a)[:, None]
-    n = np.linalg.eigh(X.T @ X)[1][:, 0]
+    planar = np.abs(N).sum(1) > 0
+    n = None
+    if planar.sum() >= 2:
+        w, v = np.linalg.eigh((N[planar] * a[planar, None]).T @ N[planar])
+        if w[1] > 1e-9 * max(w[2], 1e-30):    # walls face two ways
+            n = v[:, 0]
+    if n is None:
+        X = (P - c) * np.sqrt(a)[:, None]
+        n = np.linalg.eigh(X.T @ X)[1][:, 0]
     return c, (n if n[1] >= 0 else -n)
 
 
@@ -1302,12 +1338,63 @@ def _hyp(rel, hyp, n):
     return 2.0 * np.outer(rel @ n, n) - rel   # "Rot": upside down in-plane
 
 
+#: Two faces are pieces of one planar face only if they lie in one plane:
+#: IFace2::Normal of a planar face is exact, so their normals agree to
+#: numerical noise (0.01, ~0.6 deg), and their centroids lie in the common
+#: plane to 0.01 mm (ten times the ~1e-3 mm to which tessellated centroids
+#: reproduce).
+COPLANAR_N = 0.01
+COPLANAR_M = 1e-5
+
+
+def _coplanar(N, Q, j1, j2):
+    """Could faces j1 and j2 be pieces of one face? Planar faces: same
+    normal and plane. Non-planar faces (normal 0,0,0): both non-planar."""
+    import numpy as np
+    n1, n2 = N[j1], N[j2]
+    z1, z2 = not np.any(n1), not np.any(n2)
+    if z1 or z2:
+        return z1 and z2
+    return (float(np.linalg.norm(n1 - n2)) <= COPLANAR_N
+            and abs(float(np.dot(n1, Q[j1] - Q[j2]))) <= COPLANAR_M)
+
+
+def _pair_centroids(Q, N, a_c, target):
+    """Area-weighted centroids of candidate face PAIRS that could be one
+    face of area `target` cut in two: coplanar pieces, closer together than
+    the face's own size (sqrt(area)), combined area within GLYPH_ANCHOR_TOL
+    of it."""
+    import numpy as np
+    small = np.nonzero(a_c < target)[0]
+    if len(small) < 2:
+        return np.zeros((0, 3))
+    qn, an = Q[small], a_c[small]
+    dd = np.linalg.norm(qn[:, None] - qn[None], axis=2)
+    a2 = an[:, None] + an[None]
+    i1, i2 = np.nonzero(np.triu((dd <= math.sqrt(target))
+                                & (np.abs(a2 / target - 1.0)
+                                   <= GLYPH_ANCHOR_TOL), 1))
+    keep = [k for k in range(len(i1))
+            if _coplanar(N, Q, small[i1[k]], small[i2[k]])]
+    i1, i2 = i1[keep], i2[keep]
+    return ((qn[i1] * an[i1, None] + qn[i2] * an[i2, None])
+            / (an[i1] + an[i2])[:, None])
+
+
 def register(seed, cand, anchors=3):
     """{hyp: {"fraction", "centroid_m", "matched"}}: the largest share of a
     seed label's engraved AREA found among `cand` faces under each
     hypothesis, and where its centroid lands. Each candidate face of
     matching area proposes a placement for one of the label's largest faces;
-    the placement explaining the most area wins."""
+    the placement explaining the most area wins.
+
+    A face re-cut into two coplanar pieces keeps its total area and its
+    area-weighted centroid, so a PAIR of coplanar candidate faces may stand
+    for one seed face (combined area within GLYPH_ANCHOR_TOL, combined
+    centroid within GLYPH_POS_TOL_M): as an anchor, to complete a partial
+    match, or to match a face nothing single matched (RT10: a label re-cut
+    50/50 lost 61 % of its area)."""
+    import itertools
     import numpy as np
     seed, cand = np.asarray(seed, float), np.asarray(cand, float)
     out = {hy: {"fraction": 0.0, "centroid_m": None, "matched": 0}
@@ -1318,25 +1405,50 @@ def register(seed, cand, anchors=3):
     c, n = label_frame(seed)
     rel = P - c
     A = a_s.sum()
-    a_c, Q = cand[:, 0], cand[:, 1:4]
+    a_c, Q, N = cand[:, 0], cand[:, 1:4], cand[:, 4:7]
     ratio = a_c[None, :] / np.maximum(a_s[:, None], 1e-30)
     anchor_ok = np.abs(ratio - 1.0) <= GLYPH_ANCHOR_TOL
     area_ok = (ratio <= GLYPH_AREA_RATIO) & (ratio >= 1.0 / GLYPH_AREA_RATIO)
     big_first = np.argsort(-a_s, kind="stable")
+    proposals = {int(i): np.vstack([Q[anchor_ok[i]],
+                                    _pair_centroids(Q, N, a_c, a_s[i])])
+                 for i in big_first[:anchors]}
+    lo, hi = 1 - GLYPH_ANCHOR_TOL, 1 + GLYPH_ANCHOR_TOL
+
+    def pair_for(s, pred, used, d_s, base=None):
+        """Best unused coplanar candidate pair (or base + one candidate)
+        whose combined area-weighted centroid is within GLYPH_POS_TOL_M of
+        pred and combined area within GLYPH_ANCHOR_TOL of the face's."""
+        rad = max(GLYPH_POS_TOL_M, math.sqrt(a_s[s]))
+        near = [int(j) for j in np.nonzero(d_s <= rad)[0]
+                if int(j) not in used and a_c[j] < a_s[s]]
+        groups = ([(base, j) for j in near] if base is not None
+                  else itertools.combinations(near, 2))
+        best = None
+        for j1, j2 in groups:
+            a2 = a_c[j1] + a_c[j2]
+            if not lo <= a2 / a_s[s] <= hi or not _coplanar(N, Q, j1, j2):
+                continue
+            dd = float(np.linalg.norm(
+                (Q[j1] * a_c[j1] + Q[j2] * a_c[j2]) / a2 - pred))
+            if dd <= GLYPH_POS_TOL_M and (best is None or dd < best[0]):
+                best = (dd, j1, j2, a2)
+        return best
+
     for hy in HYPOTHESES:
         relH = _hyp(rel, hy, n)
         best, tried = out[hy], set()
         for i in big_first[:anchors]:
-            for j in np.nonzero(anchor_ok[i])[0]:
-                origin = Q[j] - relH[i]
+            for qj in proposals[int(i)]:
+                origin = qj - relH[i]
                 key = tuple(np.round(origin / GLYPH_POS_TOL_M).astype(int))
                 if key in tried:
                     continue
                 tried.add(key)
-                d = np.linalg.norm((origin + relH)[:, None, :] - Q[None],
-                                   axis=2)
+                pred = origin + relH
+                d = np.linalg.norm(pred[:, None, :] - Q[None], axis=2)
                 ok = area_ok & (d <= GLYPH_POS_TOL_M)
-                used, got, cnt = set(), 0.0, 0
+                used, got, cnt, hit = set(), 0.0, 0, {}
                 for s in big_first:
                     js = np.nonzero(ok[s])[0]
                     for jj in js[np.argsort(d[s, js], kind="stable")]:
@@ -1344,7 +1456,25 @@ def register(seed, cand, anchors=3):
                             used.add(int(jj))
                             got += min(a_s[s], a_c[jj])
                             cnt += 1
+                            hit[int(s)] = int(jj)
                             break
+                # a partial match completed by a neighbouring piece
+                for s, j1 in hit.items():
+                    if a_c[j1] >= a_s[s]:
+                        continue
+                    up = pair_for(s, pred[s], used, d[s], base=j1)
+                    if up:
+                        used.add(up[2])
+                        got += min(a_s[s], up[3]) - min(a_s[s], a_c[j1])
+                # a face no single candidate matched, matched by two pieces
+                for s in big_first:
+                    if int(s) in hit:
+                        continue
+                    pr = pair_for(int(s), pred[s], used, d[s])
+                    if pr:
+                        used.update(pr[1:3])
+                        got += min(a_s[s], pr[3])
+                        cnt += 1
                 if got / A > best["fraction"] + 1e-12:
                     best.update(fraction=float(got / A),
                                 centroid_m=origin.tolist(), matched=cnt)
@@ -1377,6 +1507,27 @@ def _glyphs(capture, ids):
     rows = [f for i in ids for f in ((capture.get("glyph_faces") or {})
                                       .get(i) or [])]
     return np.asarray(rows, float).reshape(-1, 7)
+
+
+def symbol_floor(rows, body):
+    """The floor of a button's engraved symbol: its largest planar face
+    facing up (+Y: the cut direction label_frame reads off every seed
+    symbol's walls), as {area_m2, plan offset from the button's plan centre
+    (m), depth below the button's top (m)}; None without one."""
+    e = extent_of(body) if body else None
+    if not e:
+        return None
+    best = None
+    for r in rows or []:
+        if r[5] < 1.0 - COPLANAR_N:
+            continue
+        cand = {"area_m2": r[0],
+                "offset_m": [r[1] - (e[0] + e[3]) / 2,
+                             r[3] - (e[2] + e[5]) / 2],
+                "depth_m": e[4] - r[2]}
+        if best is None or cand["area_m2"] > best["area_m2"]:
+            best = cand
+    return best
 
 
 def seed_labels(baseline):
@@ -1421,10 +1572,12 @@ def seed_labels(baseline):
     symbols = {}
     for bid in seed["roles"]["face_buttons"]:
         g = _glyphs(baseline, [bid])
-        if not len(g):
+        floor = symbol_floor((baseline.get("planar_faces") or {}).get(bid),
+                             by[bid])
+        if not len(g) and floor is None:
             continue
         c = by[bid]["centroid_m"]
-        symbols[bid] = {"faces": g, "du_m": c[0] - cx,
+        symbols[bid] = {"faces": g, "floor": floor, "du_m": c[0] - cx,
                         "dz_m": c[2] - fb["z_m"]}
     out = {"text": {}, "symbols": {}}
     for name, g in labels.items():
@@ -1437,8 +1590,16 @@ def seed_labels(baseline):
             "chiral": max(self_r["R"]["fraction"],
                           self_r["Rot"]["fraction"]) < ACHIRAL_SELF}
     for bid, s in symbols.items():
+        if not len(s["faces"]):
+            # read for presence by its floor only (criterion 6): one face
+            # says nothing about which way round it reads
+            out["symbols"][bid] = {**s, "area_m2": 0.0, "self_R": None,
+                                   "self_Rot": None, "chiral": False}
+            continue
         self_r = register(s["faces"], s["faces"])
         out["symbols"][bid] = {**s, "area_m2": float(s["faces"][:, 0].sum()),
+                               "self_R": self_r["R"]["fraction"],
+                               "self_Rot": self_r["Rot"]["fraction"],
                                "chiral": max(self_r["R"]["fraction"],
                                              self_r["Rot"]["fraction"])
                                < ACHIRAL_SELF}
@@ -1524,11 +1685,13 @@ def seed_swap_mask(m, x0, step, plane, t):
 
 
 def compare_view(seed_m, s_x0, s_k0, cand_m, c_x0, c_k0, step, plane_s,
-                 plane_c, h, t, swap):
+                 plane_c, h, t, swap, min_offset_cells=None):
     """Deviation cells of one candidate view against the seed's, the seed
     warped by the candidate's own half-widening h. Masked: the seam strip,
     swapped features (anywhere between their mirrored position and h further
-    out), steep cells and silhouette bands."""
+    out), steep cells and silhouette bands. With min_offset_cells, a uniform
+    height offset read over more compared cells than that is removed
+    first."""
     import numpy as np
     ni, nk = cand_m.shape
     uc = c_x0 + (np.arange(ni) + 0.5) * step - plane_c
@@ -1539,19 +1702,39 @@ def compare_view(seed_m, s_x0, s_k0, cand_m, c_x0, c_k0, step, plane_s,
     s = _bilinear(seed_m, fi, fk)
     gx, gk = np.gradient(np.nan_to_num(seed_m, nan=0.0), step)
     slope = _bilinear(np.hypot(gx, gk), fi, fk)
+    # A swapped feature carried outboard by the full h warps back exactly
+    # onto its mirrored seed position (j = 0); one left at the exact mirror
+    # sits up to h INBOARD of that. So the mask is looked up from the cell
+    # outboard only, 0..h (looking both ways hid a pocket beside a cluster:
+    # red-team finding RT02).
     sm = np.zeros((ni, nk), bool)
     span = int(np.ceil(abs(h) / step)) + 1
     swf = swap.astype(float)
-    for j in range(-span, span + 1):
-        sm |= np.nan_to_num(_bilinear(swf, fi + j, fk)) > 0
+    out = np.sign(uc)[:, None]
+    for j in range(0, span + 1):
+        sm |= np.nan_to_num(_bilinear(swf, fi + j * out, fk)) > 0
     seam = np.repeat((np.abs(uc) <= abs(h) + SEAM_MARGIN_M)[:, None], nk, 1)
     fc, fs = np.isfinite(cand_m), np.isfinite(s)
-    edge = _dilate(~fc | ~fs, EDGE_CELLS)
+    # Silhouette bands grow from cells empty in BOTH maps (outside the part,
+    # holes both have). Growing them from either map's empty cells swallowed
+    # every hole that only one map has, so the (fc ^ fs) term below could
+    # never fire (RT03: a hole drilled through the housing went unseen).
+    edge = _dilate(~fc & ~fs, EDGE_CELLS)
     excluded = seam | sm | edge
-    dev = ((fc & fs & (np.abs(cand_m - s) > t) & (slope <= SLOPE_MAX))
-           | (fc ^ fs)) & ~excluded
+    offset = 0.0
+    smooth = ~excluded & fc & fs & (slope <= SLOPE_MAX)
+    if min_offset_cells is not None and smooth.sum() > min_offset_cells:
+        # The frame is aligned on ONE extreme point of the housing, so a
+        # change there (a 0.1 mm pip at the lowest point, RT11) offsets the
+        # whole map. A uniform offset is a frame difference, not a surface
+        # change: the instruction moves nothing in y or z, and a real change
+        # of the housing's spans is charged by housing_yz_spans.
+        offset = float(np.median((cand_m - s)[smooth]))
+    dev = ((fc & fs & (np.abs(cand_m - offset - s) > t)
+            & (slope <= SLOPE_MAX)) | (fc ^ fs)) & ~excluded
     return dev, {"compared": int((~excluded & (fc | fs)).sum()),
                  "masked": int(excluded.sum()),
+                 "frame_offset_mm": round(offset * MM, 4),
                  "deviation_cells": int(dev.sum())}
 
 
@@ -1613,7 +1796,22 @@ def seed_map_scales(baseline, view="top"):
                   "noise_cells": int(len(d))}
 
 
-def candidate_roles(bodies, plane, seed, h):
+def seed_cluster_plan(baseline):
+    """Plan sizes (m) read off the seed: each button cluster's overall plan
+    extent and the largest single button's (for a one-piece d-pad)."""
+    by = {b["id"]: b for b in baseline["bodies"]}
+    r = baseline["seed"]["roles"]
+
+    def plan(ids):
+        es = [extent_of(by[i]) for i in ids]
+        return max(max(e[3] for e in es) - min(e[0] for e in es),
+                   max(e[5] for e in es) - min(e[2] for e in es))
+    return {"dpad_m": plan(r["dpad"]), "face_m": plan(r["face_buttons"]),
+            "button_max_m": max(plan([i]) for i in r["dpad"]
+                                + r["face_buttons"])}
+
+
+def candidate_roles(bodies, plane, seed, h, plan=None):
     """A candidate's roles. Kept bodies by seed fingerprint; clusters by
     structure; START/SELECT by scale-invariant shape near the seed's centre
     buttons. Returns (roles, diagnostics)."""
@@ -1628,20 +1826,37 @@ def candidate_roles(bodies, plane, seed, h):
     def u(i):
         return by[i]["centroid_m"][0] - plane
 
-    # kept bodies: optimal assignment, rejected beyond the seed's own
-    # half-distance between two different roles
+    # kept bodies: a candidate is congruent to a seed record within the
+    # seed's own half-distance between two different roles; among congruent
+    # ones the optimal assignment goes by POSITION -- the seed's, carried
+    # outboard by h -- so two copies of one part can never be told apart by
+    # their order in GetBodies2 (RT04). A congruent body left over is a
+    # duplicate standard part (criterion 7).
     rows = [(role, rec) for role in KEPT_ROLES for rec in seed["kept"][role]]
     taken = set()
     for role in KEPT_ROLES:
         roles[role] = []
     if rows and others:
         cost = [[fp_distance(rec, b) for b in others] for _, rec in rows]
-        ri, ci = linear_sum_assignment(cost)
+        place = []
+        for (role, rec), crow in zip(rows, cost):
+            us = rec["u_m"]
+            ue = us if role == "plane_small" else us + sgn(us) * h
+            place.append([
+                1e6 + f if f > tol else math.sqrt(
+                    (u(b["id"]) - ue) ** 2
+                    + (b["centroid_m"][1] - rec["centroid_m"][1]) ** 2
+                    + (b["centroid_m"][2] - rec["centroid_m"][2]) ** 2)
+                for b, f in zip(others, crow)])
+        ri, ci = linear_sum_assignment(place)
         for r, c in zip(ri, ci):
             if cost[r][c] <= tol:
                 roles[rows[r][0]].append(others[c]["id"])
                 taken.add(others[c]["id"])
     rest = [b for b in others if b["id"] not in taken]
+    diag["duplicate_kept"] = sorted(
+        b["id"] for b in rest if any(fp_distance(rec, b) <= tol
+                                     for _, rec in rows))
 
     # button clusters
     diamonds = find_diamonds(rest, tol)
@@ -1663,6 +1878,28 @@ def candidate_roles(bodies, plane, seed, h):
     diag["duplicate_clusters"] = dup
     in_clusters = {i for d in diamonds for i in d["ids"]}
     rest = [b for b in rest if b["id"] not in in_clusters]
+    if plan and not roles["dpad"]:
+        # No cross of four arms: a d-pad moulded in ONE piece (RT09) is a
+        # single body with a square plan (aspect <= thr, as a cross is),
+        # larger than any single seed button, sized nearer the seed's whole
+        # d-pad than its face cluster, and out in a grip (|u| beyond the
+        # centre buttons' region). Every bound is a seed measurement.
+        us = seed["clusters"]["dpad"]["u_m"]
+        u_exp = -us + sgn(-us) * h
+        one = []
+        for b in rest:
+            e, asp = extent_of(b), plan_aspect(b)
+            if (not e or asp is None or asp > thr
+                    or abs(u(b["id"])) * MM < CENTRE_U_MAX_MM):
+                continue
+            size = max(e[3] - e[0], e[5] - e[2])
+            if size > plan["button_max_m"] and (
+                    abs(size - plan["dpad_m"]) < abs(size - plan["face_m"])):
+                one.append((abs(u(b["id"]) - u_exp), b["id"]))
+        if one:
+            roles["dpad"] = [min(one)[1]]
+            rest = [b for b in rest if b["id"] != roles["dpad"][0]]
+            diag["dpad_one_piece"] = True
 
     # START / SELECT: off-plane bodies near either seed centre button's
     # seed or mirrored position (|u| from the seed's to h further out)
@@ -1728,7 +1965,8 @@ def capture(doc, baseline=None):
             plane, _, wmeas = widening(xsec, hext, seed)
             h = (wmeas["dsep_m"] if wmeas["dsep_m"] is not None
                  else wmeas["dext_m"]) / 2
-            roles, rdiag = candidate_roles(bodies, plane, seed, h)
+            roles, rdiag = candidate_roles(bodies, plane, seed, h,
+                                           plan=seed_cluster_plan(baseline))
         else:
             plane0 = (hext[0] + hext[3]) / 2
             plane, _ = plane_from_lobes(
@@ -1798,10 +2036,10 @@ def rebuild_delta(rb, baseline):
 
 
 def translate_yz(measured, dy, dz):
-    """A copy of a capture moved by (0, dy, dz): bodies, extents, glyph
-    faces, map origins and the heights the maps store (top / bottom hold
-    absolute y, front / back absolute z). X needs no such step -- everything
-    along X is read relative to the part's own mirror plane."""
+    """A copy of a capture moved by (0, dy, dz): bodies, extents, glyph and
+    planar faces, map origins and the heights the maps store (top / bottom
+    hold absolute y, front / back absolute z). X needs no such step --
+    everything along X is read relative to the part's own mirror plane."""
     import copy
     out = copy.deepcopy(measured)
     for b in out.get("bodies", []):
@@ -1812,10 +2050,11 @@ def translate_yz(measured, dy, dz):
             if e and len(e) == 6:
                 b[key] = [e[0], e[1] + dy, e[2] + dz, e[3], e[4] + dy,
                           e[5] + dz]
-    for rows in (out.get("glyph_faces") or {}).values():
-        for r in rows:
-            r[2] += dy
-            r[3] += dz
+    for key in ("glyph_faces", "planar_faces"):
+        for rows in (out.get(key) or {}).values():
+            for r in rows:
+                r[2] += dy
+                r[3] += dz
     hm = out.get("housing_maps")
     if hm:
         o = hm["origin_m"]
@@ -1877,8 +2116,9 @@ class Grader:
             self.h = self.wm["dext_m"] / 2
             self.notes.append("grip lobes unreadable: the stance h is taken "
                               "from the body X extent instead")
-        self.roles, self.rdiag = candidate_roles(measured["bodies"], self.P,
-                                                 self.seed, self.h)
+        self.roles, self.rdiag = candidate_roles(
+            measured["bodies"], self.P, self.seed, self.h,
+            plan=seed_cluster_plan(baseline))
         self._lab = None
 
     def u(self, i):
@@ -1950,7 +2190,12 @@ class Grader:
     # -- 2 ---------------------------------------------------------------
     def _interference_growth_mm3(self):
         intf = self.ms.get("interference") or {}
+        # Duplicate clusters count as controls: the capture's census already
+        # covers them, and a left-over button that clashes with a moved one
+        # does not fit, whatever role it was given (RT01).
         controls = {i for r in CONTROL_ROLES for i in self.roles.get(r, [])}
+        controls |= {i for g in self.rdiag.get("duplicate_clusters", [])
+                     for i in g}
         hs = set(self.hids)
         vol = 0.0
         for p in intf.get("pairs", []):
@@ -1966,10 +2211,11 @@ class Grader:
         h = self.h
         det = {"h_mm": round(h * MM, 3)}
         place, rigid = {}, {}
+        sb = {b["id"]: b for b in self.bl["bodies"]}
         for role in ("dpad", "face_buttons"):
             sc = self.seed["clusters"][role]
             ids = self.roles.get(role) or []
-            if len(ids) != 4:
+            if len(ids) not in (4, 1):         # 1: a one-piece d-pad
                 place[role] = 0.0
                 det[role] = {"missing": True}
                 continue
@@ -1977,21 +2223,36 @@ class Grader:
             us = sc["u_m"]
             ue = -us + sgn(-us) * h
             dx = (uc - ue) * MM
+            # "Mirrored positions" moves a cluster in x only: its z and the
+            # height of its TOP must stay (RT05: clusters floating 4 mm
+            # high, or 6 mm off in z, scored 1.0). The top, not the
+            # centroid, because a rebuilt button moves its centroid (the
+            # reference's: 2.5-3 mm in y, top 0.02 mm). Same tolerance as
+            # every other y/z drift: the instruction moves nothing in y or z.
+            dz = (mean(self.C[i]["centroid_m"][2] for i in ids)
+                  - sc["z_m"]) * MM
+            dtop = (max(extent_of(self.C[i])[4] for i in ids)
+                    - max(extent_of(sb[i])[4] for i in sc["ids"])) * MM
+            yz = score_error(max(abs(dz), abs(dtop)),
+                             TOL["drift_perfect_mm"], TOL["drift_zero_mm"])
             place[role] = score_error(dx, TOL["space_perfect_mm"],
-                                      TOL["space_zero_mm"])
-            dists = _pair_dists(self.ms["bodies"], ids)
-            drift = max(abs(a - b) for a, b in
-                        zip(dists, sc["pair_dists_m"])) * MM
+                                      TOL["space_zero_mm"]) * yz
+            if len(ids) == 4:
+                dists = _pair_dists(self.ms["bodies"], ids)
+                drift = max(abs(a - b) for a, b in
+                            zip(dists, sc["pair_dists_m"])) * MM
+            else:
+                drift = 0.0                    # one rigid body
             rigid[role] = score_error(drift, TOL["rigid_perfect_mm"],
                                       TOL["rigid_zero_mm"])
-            yz = [mean(self.C[i]["centroid_m"][1] for i in ids) - sc["y_m"],
-                  mean(self.C[i]["centroid_m"][2] for i in ids) - sc["z_m"]]
             det[role] = {"u_mm": round(uc * MM, 3),
                          "expected_u_mm": round(ue * MM, 3),
                          "dx_mm": round(dx, 3),
+                         "dz_mm": round(dz, 3),
+                         "dtop_mm": round(dtop, 3),
+                         "yz_score": round(yz, 4),
                          "spacing_drift_mm": round(drift, 3),
-                         "dy_mm_reported": round(yz[0] * MM, 3),
-                         "dz_mm_reported": round(yz[1] * MM, 3)}
+                         "one_piece": len(ids) == 1}
         base = mean(place.values())
         follow = []
         for role in PAIR_ROLES:
@@ -2021,20 +2282,54 @@ class Grader:
                             "fit qualify that credit"}
 
     # -- 3 ---------------------------------------------------------------
+    def _cluster_copies(self):
+        """{role: [u (m) of each duplicate cross that is a COPY of that
+        cluster]}. An elongated cross is a d-pad (the seed has no other);
+        a round cross is the face cluster only if it carries a face-button
+        symbol -- a round cross without one is not identifiable (a d-pad
+        rebuilt with round arms is one), so it stays a reported duplicate."""
+        thr = self.seed["aspect_threshold"]
+        dups = [d for d in self.rdiag.get("clusters", [])
+                if d["ids"] in self.rdiag.get("duplicate_clusters", [])]
+        out = {"dpad": [], "face_buttons": []}
+        sym = None
+        for d in dups:
+            if d["aspect"] > thr:
+                out["dpad"].append(d["u_mm"] / MM)
+                continue
+            if sym is None:
+                sym = seed_labels(self.bl)["symbols"]
+            F = _glyphs(self.ms, d["ids"])
+            if any(max(register(S["faces"], F)[hy]["fraction"]
+                       for hy in HYPOTHESES) >= PRESENCE_ZERO
+                   for S in sym.values()):
+                out["face_buttons"].append(d["u_mm"] / MM)
+        return out
+
     def c_swap(self):
         parts, det = {}, {}
+        copies = self._cluster_copies()
         for role in ("dpad", "face_buttons"):
             sc = self.seed["clusters"][role]
             ids = self.roles.get(role) or []
-            if len(ids) != 4:
+            if len(ids) not in (4, 1):         # 1: a one-piece d-pad
                 parts[role] = 0.0
                 det[role] = {"missing": True}
                 continue
             uc = mean(self.u(i) for i in ids)
             side = -sgn(sc["u_m"])
-            parts[role] = clamp01(0.5 + side * uc / (2 * sc["radius_m"]))
+
+            def side_score(u, side=side, sc=sc):
+                return clamp01(0.5 + side * u / (2 * sc["radius_m"]))
+            # A copy left behind means the cluster was copied, not swapped
+            # "to the opposite side from where they currently sit" (RT01):
+            # the score is the mean over all its copies.
+            parts[role] = mean([side_score(uc)]
+                               + [side_score(u) for u in copies[role]])
             det[role] = {"u_mm": round(uc * MM, 2),
                          "required_side": "+" if side > 0 else "-",
+                         "copies_left_mm": [round(u * MM, 2)
+                                            for u in copies[role]],
                          "score": round(parts[role], 4)}
         if self.rdiag.get("duplicate_clusters"):
             det["duplicate_clusters"] = self.rdiag["duplicate_clusters"]
@@ -2042,9 +2337,10 @@ class Grader:
         return {"score": round(score, 4), "status": status_of(score),
                 "detail": det,
                 "evidence": "each cluster's side of the candidate's own "
-                            "plane, ramped over one seed cluster radius; a "
-                            "missing cluster (or a copy of the other in its "
-                            "place) scores 0"}
+                            "plane, ramped over one seed cluster radius and "
+                            "averaged over every copy of it; a missing "
+                            "cluster (or a copy of the other in its place) "
+                            "scores 0"}
 
     # -- 4 ---------------------------------------------------------------
     def _band_score(self, uc, us, perfect_mm):
@@ -2109,17 +2405,28 @@ class Grader:
         # charged once -- by criterion 6 -- and not again here.
         margin = 0.5 * min((1.0 - max(L["self_R"], L["self_Rot"]))
                            for L in sl["text"].values() if L["chiral"])
+
+        def readable(L):
+            # The wrong readings this item can be told apart from: those the
+            # seed's own engraving does NOT reproduce. A triangle matches
+            # its own mirror, so a naive mirror cannot flip it, but it does
+            # not match its own 180-degree turn, so upside down is caught
+            # (RT07). An item matching both is skipped.
+            return [hy for hy in ("R", "Rot")
+                    if L[f"self_{hy}"] < ACHIRAL_SELF]
         for name, r in text.items():
             fr = {hy: round(r[hy]["fraction"], 4) for hy in HYPOTHESES}
             det[f"text {name}"] = fr
-            if not sl["text"][name]["chiral"]:
-                skipped[f"text {name}"] = "achiral: matches its own mirror"
+            alts = readable(sl["text"][name])
+            if not alts:
+                skipped[f"text {name}"] = ("achiral: matches its own mirror "
+                                           "and its own rotation")
                 continue
             if max(fr.values()) < PRESENCE_ZERO:
                 skipped[f"text {name}"] = "absent (criterion 6 charges it)"
                 continue
             items[f"text {name}"] = clamp01(
-                0.5 + (fr["T"] - max(fr["R"], fr["Rot"])) / (2 * margin))
+                0.5 + (fr["T"] - max(fr[a] for a in alts)) / (2 * margin))
         det["reading_margin"] = round(margin, 4)
         fb = self.roles.get("face_buttons") or []
         if len(fb) == 4:
@@ -2128,6 +2435,10 @@ class Grader:
             for bid, S in sl["symbols"].items():
                 r = sym[bid]
                 name = self.symbol_name(S)
+                if not len(S["faces"]):
+                    skipped[name] = ("no engraving-scale face: read for "
+                                     "presence by its floor (criterion 6)")
+                    continue
                 best = max(HYPOTHESES, key=lambda hy: r[hy]["fraction"])
                 if r[best]["fraction"] < PRESENCE_ZERO:
                     skipped[name] = "absent (criterion 6 charges it)"
@@ -2140,13 +2451,15 @@ class Grader:
                     det[f"{name} side"] = {"seed_du_mm": round(S["du_m"] * MM,
                                                                2),
                                            "du_mm": round(du * MM, 2)}
-                if S["chiral"]:
+                alts = readable(S)
+                if alts:
                     fr = {hy: r[hy]["fraction"] for hy in HYPOTHESES}
                     items[f"{name} reading"] = clamp01(
-                        0.5 + (fr["T"] - max(fr["R"], fr["Rot"]))
+                        0.5 + (fr["T"] - max(fr[a] for a in alts))
                         / (2 * margin))
                     det[f"{name} reading"] = {k: round(v, 4)
                                               for k, v in fr.items()}
+                    det[f"{name} reading"]["read_against"] = alts
         s_seed = sl.get("start_skew")
         st = self.roles.get("start") or []
         if s_seed is not None and abs(s_seed) >= SKEW_MIN and st:
@@ -2190,6 +2503,39 @@ class Grader:
         return out
 
     # -- 6 ---------------------------------------------------------------
+    def _floor_found(self, S):
+        """Share of a symbol's floor found on the candidate: on the face
+        button in the symbol's place (nearest its seed offset from the
+        cluster centre), a planar face facing up whose area is within
+        GLYPH_AREA_RATIO of the seed's and whose plan offset from that
+        button's centre and depth below its top are each within
+        GLYPH_POS_TOL_M of the seed's (RT16: a deleted circle scored 1.0).
+        None when the capture predates planar faces."""
+        import numpy as np
+        if "planar_faces" not in self.ms or S.get("floor") is None:
+            return None
+        fb = self.roles.get("face_buttons") or []
+        if len(fb) != 4:
+            return 0.0
+        cx = mean(self.C[i]["centroid_m"][0] for i in fb)
+        cz = mean(self.C[i]["centroid_m"][2] for i in fb)
+        bid = min(fb, key=lambda i: math.hypot(
+            self.C[i]["centroid_m"][0] - cx - S["du_m"],
+            self.C[i]["centroid_m"][2] - cz - S["dz_m"]))
+        want = S["floor"]
+        got = symbol_floor((self.ms.get("planar_faces") or {}).get(bid),
+                           self.C[bid])
+        if got is None:
+            return 0.0
+        ratio = got["area_m2"] / want["area_m2"]
+        off = np.hypot(*(np.asarray(got["offset_m"])
+                         - np.asarray(want["offset_m"])))
+        if (1 / GLYPH_AREA_RATIO <= ratio <= GLYPH_AREA_RATIO
+                and off <= GLYPH_POS_TOL_M
+                and abs(got["depth_m"] - want["depth_m"]) <= GLYPH_POS_TOL_M):
+            return min(want["area_m2"], got["area_m2"]) / want["area_m2"]
+        return 0.0
+
     def c_kept(self):
         if not (self.bl.get("glyph_faces") and self.ms.get("glyph_faces")):
             return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
@@ -2202,8 +2548,14 @@ class Grader:
             f = max(r[hy]["fraction"] for hy in HYPOTHESES)
             items[f"text {name}"] = f
         for bid, r in sym.items():
-            f = max(r[hy]["fraction"] for hy in HYPOTHESES)
-            items[self.symbol_name(sl["symbols"][bid])] = f
+            S = sl["symbols"][bid]
+            if len(S["faces"]):
+                f = max(r[hy]["fraction"] for hy in HYPOTHESES)
+            else:
+                f = self._floor_found(S)
+                if f is None:            # a capture without planar faces
+                    continue
+            items[self.symbol_name(S)] = f
         scores = {k: score_ratio(f, PRESENCE_FULL, PRESENCE_ZERO)
                   for k, f in items.items()}
         s = min(scores.values()) if scores else NEUTRAL_UNVERIFIABLE
@@ -2221,6 +2573,30 @@ class Grader:
                             f"{items.get(worst, 0):.0%}"}
 
     # -- 7 (housing surface) ---------------------------------------------
+    def _bodies_above_housing(self, top, xs, zs, t):
+        """Top-view cells where a body that is neither housing nor any role
+        (duplicate clusters are charged by criteria 2 and 3) stands above
+        the housing's top surface by more than t, or over no housing at all.
+        Read on the body's plan extent: a cell counts only where the body's
+        highest point clears the housing there."""
+        import numpy as np
+        roled = {i for r, ids in self.roles.items() if r != "other"
+                 for i in ids}
+        dups = {i for g in self.rdiag.get("duplicate_clusters", []) for i in g}
+        out = np.zeros(top.shape, bool)
+        for b in self.ms["bodies"]:
+            i = b["id"]
+            if i in self.hids or i in roled or i in dups:
+                continue
+            e = extent_of(b)
+            if not e:
+                continue
+            cell = np.outer((xs >= e[0]) & (xs <= e[3]),
+                            (zs >= e[2]) & (zs <= e[5]))
+            out |= cell & (~np.isfinite(top)
+                           | (e[4] > np.nan_to_num(top, nan=-np.inf) + t))
+        return out
+
     def surface_deviation(self):
         """Housing height maps against the seed's, warped by this part's own
         widening. SCORED: the top view -- the controller's visible face, where
@@ -2229,7 +2605,10 @@ class Grader:
         reference rebuilds those). REPORTED: bottom, front, back, which the
         reference itself changes (shoulder openings, rear LED windows, the
         shell parting line). Added hardware is not masked, so adding a body
-        cannot hide a cut."""
+        cannot hide a cut; a body that rises ABOVE the housing's top surface
+        outside every role (a stray block, RT06) changes the top view and is
+        counted with it. Bodies inside the shell (the reference's screws and
+        LED domes) do not."""
         import numpy as np
         sm, cm = self.bl.get("housing_maps"), self.ms.get("housing_maps")
         if not (sm and cm):
@@ -2248,9 +2627,14 @@ class Grader:
             S = _dec(sm[view], sm[shp])
             C = _dec(cm[view], cm[shp])
             swap = seed_swap_mask(S, sm["origin_m"][0], step, plane_s, t)
+            # A frame offset is read only from more cells than twice the
+            # area at which this check scores zero, so a change big enough
+            # to score zero can never be the majority it is read from.
             dev, st = compare_view(S, sm["origin_m"][0], sm["origin_m"][kax],
                                    C, cm["origin_m"][0], cm["origin_m"][kax],
-                                   step, plane_s, self.P, self.h, t, swap)
+                                   step, plane_s, self.P, self.h, t, swap,
+                                   min_offset_cells=2 * 10 * a_letter
+                                   / step ** 2)
             if view == "top":
                 ni, nk = C.shape
                 xs = cm["origin_m"][0] + (np.arange(ni) + 0.5) * step
@@ -2264,8 +2648,11 @@ class Grader:
                             (xs >= e[0] - pad) & (xs <= e[3] + pad),
                             (zs >= e[2] - pad) & (zs <= e[5] + pad))
                 dev = dev & ~foot
+                above = self._bodies_above_housing(C, xs, zs, t)
+                dev = dev | above
                 st["deviation_cells"] = int(dev.sum())
                 st["control_footprint_cells"] = int(foot.sum())
+                st["extra_body_cells"] = int(above.sum())
             st["area_mm2"] = round(st["deviation_cells"] * (step * MM) ** 2, 1)
             if st["deviation_cells"]:
                 ii, kk = np.nonzero(dev)
@@ -2308,6 +2695,11 @@ class Grader:
                    abs((self.hext[5] - self.hext[2]) - (sh[5] - sh[2]))) * MM
         parts["housing_yz_spans"] = score_error(span, TOL["span_perfect_mm"],
                                                 TOL["span_zero_mm"])
+        # The seed has exactly one of each standard part per place; a second
+        # body congruent to one (a stick copied instead of moved, RT04) is a
+        # part nobody asked for. Counted: none 1, one or more 0.
+        dup_kept = self.rdiag.get("duplicate_kept") or []
+        parts["no_duplicate_parts"] = score_error(len(dup_kept), 0, 1)
         if with_surface:
             surf = self.surface_deviation()
             if surf is not None:
@@ -2316,6 +2708,7 @@ class Grader:
         det.update({"worst_fingerprint_distance": round(worst_fp, 5),
                     "worst_yz_drift_mm": round(worst_drift, 3),
                     "missing_kept_roles": missing,
+                    "duplicate_kept_bodies": dup_kept,
                     "housing_span_change_mm": round(span, 3),
                     "unassigned_bodies_reported": self.roles.get("other"),
                     "housing_bodies": len(self.hids)})
@@ -2324,9 +2717,11 @@ class Grader:
                 "components": {k: round(v, 4) for k, v in parts.items()},
                 "detail": det,
                 "evidence": "the weakest part decides: bodies the edit leaves "
-                            "alone keep shape and y/z, the housing keeps its "
-                            "Y/Z spans and, outside the edit zones, its top "
-                            "surface. Added hardware is reported, not scored"}
+                            "alone keep shape and y/z and are not duplicated, "
+                            "the housing keeps its Y/Z spans and, outside the "
+                            "edit zones, its top surface (no body rising "
+                            "above it). Hardware inside the shell is "
+                            "reported, not scored"}
 
     # -- 8 ---------------------------------------------------------------
     def c_rebuild(self):
@@ -2585,7 +2980,7 @@ main = PS3Harness.as_main()
 
 BASELINE_REQUIRED_KEYS = ("bodies", "seed", "plane_x_m", "xsection",
                           "modelling", "rebuild", "glyph_faces",
-                          "housing_maps")
+                          "planar_faces", "housing_maps")
 BASELINE = HB.Baseline(BASELINE_PATH, BASELINE_SCHEMA,
                        BASELINE_REQUIRED_KEYS)
 
@@ -2616,6 +3011,7 @@ def capture_baseline(path, out_path=None):
         "housing_ids": cap["housing_ids"],
         "xsection": cap["xsection"],
         "glyph_faces": cap["glyph_faces"],
+        "planar_faces": cap["planar_faces"],
         "body_skew_x": cap["body_skew_x"],
         "housing_maps": cap["housing_maps"],
         "interference": {k: cap["interference"][k] for k in
